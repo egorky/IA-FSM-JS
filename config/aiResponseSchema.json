@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AIResponse",
+  "description": "Schema for validating the JSON output from the AI service.",
+  "type": "object",
+  "properties": {
+    "intent": {
+      "description": "The primary intent identified by the AI from the user's input.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9_]+$"
+    },
+    "parameters": {
+      "description": "Key-value pairs of parameters extracted by the AI.",
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "boolean", "null"]
+      }
+    }
+  },
+  "required": [
+    "intent",
+    "parameters"
+  ],
+  "additionalProperties": false
+}

@@ -1,190 +1,216 @@
 const Ari = require('ari-client');
-const fsm = require('./fsm');
-const { loadStateConfig } = require('./configLoader'); // Para asegurar que esté cargada
+const { loadStateConfig } = require('./configLoader');
+const logger = require('./logger');
+const redisClient = require('./redisClient');
 
 const ARI_APP_NAME = process.env.ARI_APP_NAME || 'fsm-ari-app';
 const ARI_USERNAME = process.env.ARI_USERNAME || 'ariuser';
 const ARI_PASSWORD = process.env.ARI_PASSWORD || 'aripass';
-const ARI_URL = process.env.ARI_URL || 'http://localhost:8088'; // ej: 'http://asterisk_ip:8088'
+const ARI_URL = process.env.ARI_URL || 'http://localhost:8088';
 
-let ariClient = null;
+let ariClientInstance = null; // Renamed to avoid conflict
+let aiInputHandlerAri; // Placeholder for the AI input handler
 
-/**
- * Procesa los datos de una llamada entrante a la aplicación Stasis.
- * @param {object} event El evento StasisStart.
- * @param {object} channel El canal de la llamada.
- */
+// Store active channels and their associated speech recognition objects if using external ASR
+const activeChannels = new Map();
+
+async function playPrompt(channel, promptTextOrSound) {
+  if (!promptTextOrSound) return;
+  try {
+    // Basic heuristic: if it contains 'sound:' or 'recording:', assume it's a media URI
+    // Otherwise, it might be text for a TTS engine (not implemented here, would require one)
+    if (promptTextOrSound.startsWith('sound:') || promptTextOrSound.startsWith('recording:')) {
+      logger.info({ channelId: channel.id, media: promptTextOrSound }, 'ARI: Playing sound.');
+      await channel.play({ media: promptTextOrSound });
+    } else {
+      // Placeholder for TTS. For now, just log it.
+      logger.info({ channelId: channel.id, ttsText: promptTextOrSound }, 'ARI: TTS prompt (not played, TTS engine needed).');
+      // Example: await channel.play({ media: `sound:tts-prefix-${promptTextOrSound}`}); // If TTS generates files
+    }
+  } catch (playError) {
+    logger.error({ err: playError, channelId: channel.id, prompt: promptTextOrSound }, 'ARI: Error playing prompt.');
+  }
+}
+
+async function processAriLogic(sessionId, fsmResult, channel) {
+  logger.info({ sessionId, nextState: fsmResult.nextStateId }, 'ARI: Processing FSM result.');
+
+  // 1. Act on payloadResponse (e.g., play sounds, TTS)
+  if (fsmResult.payloadResponse) {
+    // Example: if payloadResponse has a "prompt" field, play it.
+    // This needs to be adapted to your specific payloadResponse structure.
+    if (fsmResult.payloadResponse.greeting) {
+      await playPrompt(channel, fsmResult.payloadResponse.greeting);
+    }
+    if (fsmResult.payloadResponse.prompts && fsmResult.payloadResponse.prompts.main) {
+      await playPrompt(channel, fsmResult.payloadResponse.prompts.main);
+    } else if (fsmResult.payloadResponse.finalMessage) {
+      await playPrompt(channel, fsmResult.payloadResponse.finalMessage);
+       // If it's a final message, consider hanging up or waiting for user to hangup.
+       if (!fsmResult.parametersToCollect || fsmResult.parametersToCollect.required.length === 0) {
+        logger.info({sessionId}, "ARI: Final message played, no more params to collect. Hanging up channel.");
+        // await channel.hangup().catch(e => logger.error({err: e, sessionId}, "Error hanging up channel after final message"));
+        // For now, let the call continue, user might hangup. Or implement explicit hangup state.
+       }
+    }
+    // Add more logic here to interpret other parts of payloadResponse
+  }
+
+  // 2. If parameters are needed, prepare for input (e.g., start ASR, listen for DTMF)
+  if (fsmResult.parametersToCollect && fsmResult.parametersToCollect.required.length > 0) {
+    const firstRequiredParam = fsmResult.parametersToCollect.required[0];
+    logger.info({ sessionId, param: firstRequiredParam }, `ARI: Need to collect parameter '${firstRequiredParam}'.`);
+    // This is where you would typically:
+    // - Play a prompt asking for this parameter (e.g., "Please say your ID number")
+    // - Start listening for DTMF: channel.on('ChannelDtmfReceived', dtmfHandler);
+    // - Or, more complex: bridge to an ASR application or use ARI external media for streaming.
+    // For this example, we'll assume DTMF or some other event will trigger a new text input.
+    // A more complete IVR would require detailed state management for input gathering here.
+    // For now, we just log. The actual input will come from a subsequent event.
+    await playPrompt(channel, `Please provide ${firstRequiredParam.replace(/_/g, ' ')}.`);
+  } else {
+    logger.info({ sessionId }, 'ARI: No more parameters to collect for this state.');
+  }
+}
+
+
 async function handleStasisStart(event, channel) {
-  console.log(`ARI: Llamada ${channel.id} entrando a la aplicación Stasis ${ARI_APP_NAME}`);
+  logger.info({ channelId: channel.id, app: ARI_APP_NAME }, `ARI: Call entering Stasis app`);
+  activeChannels.set(channel.id, { channel }); // Store channel
 
-  // El sessionId para la FSM será el ID del canal de Asterisk.
   const sessionId = channel.id;
-  let currentFsmState;
 
   try {
-    // Inicializar o restaurar la sesión FSM.
-    // Para ARI, la primera interacción no suele traer 'intent' o 'parameters' explícitos,
-    // se asume que se inicia el flujo.
-    currentFsmState = await fsm.processInput(sessionId, null, {});
-    console.log(`ARI: Sesión FSM ${sessionId} iniciada/restaurada. Estado actual: ${currentFsmState.nextStateId}`);
-
     await channel.answer();
-    console.log(`ARI: Canal ${channel.id} respondido.`);
+    logger.info({ channelId: sessionId }, `ARI: Channel answered.`);
 
-    // Aquí comienza la lógica de interacción con el usuario vía ARI.
-    // Esto es un esqueleto y necesitará ser expandido enormemente.
-    // Por ejemplo, reproducir un audio, esperar DTMF, etc.
+    // Initial interaction: send a "welcome" or "empty" text to AI to get the first FSM state.
+    // Or, if you have a specific "call_start" intent:
+    // const initialFsmInput = { intent: "call_start", parameters: { caller_id: channel.caller.number }};
+    // const fsmInitialResult = await fsm.processInput(sessionId, initialFsmInput.intent, initialFsmInput.parameters);
 
-    // 1. Procesar el payloadResponse devuelto por la FSM.
-    // Para ARI, el contenido de payloadResponse necesitará ser interpretado
-    // para realizar acciones de llamada (reproducir audios, etc.).
-    if (currentFsmState.payloadResponse && Object.keys(currentFsmState.payloadResponse).length > 0) {
-      console.log(`ARI: Para el estado ${currentFsmState.nextStateId}, se recibió el siguiente payloadResponse:`);
-      console.log(JSON.stringify(currentFsmState.payloadResponse, null, 2)); // Loguear el payload completo
+    // For AI-first approach, send a generic input or observed data
+    const initialTextForAI = `New call started from ${channel.caller?.number || 'unknown'}.`;
+    // Log initial "text" to Redis
+    redisClient.set(`ari_initial_text:${sessionId}:${Date.now()}`, JSON.stringify({textInput: initialTextForAI}), 'EX', 3600)
+        .catch(err => logger.error({err, sessionId}, "Failed to log ARI initial text to Redis"));
 
-      // Ejemplo de cómo se podría buscar una clave específica dentro de payloadResponse,
-      // como los antiguos 'apiHooks' si se mantiene esa sub-estructura, o 'prompts'.
-      if (currentFsmState.payloadResponse.apiHooks) {
-        const onEnterApis = currentFsmState.payloadResponse.apiHooks.onEnterState;
-        if (onEnterApis && onEnterApis.length > 0) {
-          console.log(`ARI: (Dentro de payloadResponse) Hook 'onEnterState' APIs: ${onEnterApis.join(', ')}`);
-          // await channel.setChannelVar({ variable: 'ON_ENTER_APIS', value: onEnterApis.join(',') });
-        }
-      }
-      if (currentFsmState.payloadResponse.prompts && currentFsmState.payloadResponse.prompts.main) {
-        console.log(`ARI: (Dentro de payloadResponse) Prompt principal: ${currentFsmState.payloadResponse.prompts.main}`);
-        // Ejemplo de acción ARI: reproducir este prompt (requiere que el prompt sea un archivo de sonido válido o use TTS)
-        // try {
-        //   await channel.play({ media: `sound:${currentFsmState.payloadResponse.prompts.main}` });
-        // } catch (playError) {
-        //   console.error(`ARI: Error al intentar reproducir prompt: ${playError}`);
-        // }
-      }
-      // La lógica real para actuar sobre el payloadResponse en ARI será específica de la aplicación.
-    }
-
-    // 2. Determinar qué preguntar o qué hacer basándose en `parametersToCollect`
-    // Esta es la parte más compleja y depende mucho de cómo se quiera interactuar.
-    // Ejemplo muy básico: si hay parámetros requeridos, reproducir un mensaje genérico.
-    if (currentFsmState.parametersToCollect && currentFsmState.parametersToCollect.required.length > 0) {
-      const firstRequiredParam = currentFsmState.parametersToCollect.required[0];
-      const promptFile = `sound:fsm_prompt_for_${firstRequiredParam}`; // ej: fsm_prompt_for_patient_id_number
-      console.log(`ARI: Solicitando parámetro ${firstRequiredParam}. Reproduciendo ${promptFile}`);
-
-      // Ejemplo de cómo se podría usar play y luego esperar por DTMF o ASR (no implementado aquí)
-      // await channel.play({ media: promptFile });
-      // Luego, se necesitaría un handler para StasisDTMFReceived o un puente a una app ASR.
-    } else {
-      // Si no hay parámetros que recolectar, quizás el estado es informativo o final.
-      const currentStateConfig = currentFsmState.nextStateConfig; // El estado al que se llegó
-      if (currentStateConfig && currentStateConfig.description) {
-          console.log(`ARI: Estado ${currentFsmState.nextStateId} alcanzado. Descripción: ${currentStateConfig.description}`);
-          // Podría reproducir un mensaje relacionado con la descripción.
-          // await channel.play({ media: `sound:fsm_state_${currentFsmState.nextStateId}` });
-      }
-    }
-
-    // IMPORTANTE: Esta función `handleStasisStart` solo maneja el inicio.
-    // Se necesitarían handlers para `StasisDTMFReceived`, `ChannelHangupRequest`, etc.,
-    // para continuar la interacción y alimentar de vuelta a `fsm.processInput`.
-    // Por ejemplo, en `StasisDTMFReceived`, se recogería el DTMF, se mapearía a un parámetro
-    // y/o intención, y se llamaría a `fsm.processInput(sessionId, intent, { paramName: dtmfValue })`.
-    // La respuesta de la FSM indicaría el siguiente paso, que se traduciría a acciones ARI.
+    const fsmResult = await aiInputHandlerAri(sessionId, initialTextForAI, 'ari-stasis-start');
+    await processAriLogic(sessionId, fsmResult, channel);
 
   } catch (error) {
-    console.error(`ARI: Error en StasisStart para el canal ${channel.id}:`, error);
-    // Intentar colgar la llamada si aún está activa y hay un error grave.
+    logger.error({ err: error, channelId: sessionId }, 'ARI: Error in StasisStart.');
     try {
       await channel.hangup();
-      console.log(`ARI: Canal ${channel.id} colgado debido a un error.`);
     } catch (hangupError) {
-      console.error(`ARI: Error al intentar colgar el canal ${channel.id}:`, hangupError);
+      logger.error({ err: hangupError, channelId: sessionId }, 'ARI: Error trying to hangup channel during StasisStart error.');
     }
   }
 }
 
+// Example DTMF handler (needs to be registered on the channel object)
+async function handleDtmfReceived(event, channel) {
+  const digit = event.digit;
+  const sessionId = channel.id;
+  logger.info({ channelId: sessionId, digit }, `ARI: DTMF digit received: ${digit}`);
 
-/**
- * Manejador para el evento StasisEnd.
- * @param {object} event El evento StasisEnd.
- * @param {object} channel El canal que finalizó.
- */
-async function handleStasisEnd(event, channel) {
-  console.log(`ARI: Llamada ${channel.id} finalizando en aplicación Stasis ${ARI_APP_NAME}`);
-  // Aquí se podría limpiar la sesión de Redis si se desea,
-  // aunque generalmente se deja que expire para poder retomar si la llamada cae y vuelve.
-  // Ejemplo:
-  // const sessionId = channel.id;
-  // await redisClient.del(`${FSM_SESSION_PREFIX}${sessionId}`); // Asumiendo que FSM_SESSION_PREFIX está disponible
-  // console.log(`ARI: Sesión FSM ${sessionId} limpiada de Redis.`);
+  const channelData = activeChannels.get(sessionId);
+  if (!channelData) return;
+
+  // Accumulate DTMF or process immediately. This is a simplified example.
+  // A real IVR would accumulate digits until a terminator (#) or timeout.
+  // Let's assume a single digit is a complete input for simplicity of AI interaction.
+  const textInput = `User pressed DTMF: ${digit}`; // Or accumulated DTMF string.
+
+  // Log DTMF "text" to Redis
+  redisClient.set(`ari_dtmf_input:${sessionId}:${Date.now()}`, JSON.stringify({textInput}), 'EX', 3600)
+    .catch(err => logger.error({err, sessionId}, "Failed to log ARI DTMF input to Redis"));
+
+  try {
+    const fsmResult = await aiInputHandlerAri(sessionId, textInput, 'ari-dtmf');
+    await processAriLogic(sessionId, fsmResult, channel);
+  } catch (error) {
+    logger.error({ err: error, channelId: sessionId, dtmf: digit }, 'ARI: Error processing DTMF input via FSM.');
+  }
 }
 
-/**
- * Conecta al cliente ARI y registra la aplicación Stasis.
- */
-async function connectAri() {
-  if (ariClient) {
-    return ariClient;
+
+async function handleStasisEnd(event, channel) {
+  logger.info({ channelId: channel.id, app: ARI_APP_NAME }, `ARI: Call leaving Stasis app`);
+  activeChannels.delete(channel.id); // Clean up
+  // Optional: Log call end to Redis or clean up session
+  redisClient.set(`ari_call_end:${channel.id}:${Date.now()}`, JSON.stringify({status: 'ended'}), 'EX', 3600*24)
+    .catch(err => logger.error({err, channelId: channel.id}, "Failed to log ARI call end to Redis"));
+}
+
+async function connectAri(handler) {
+  if (typeof handler !== 'function') {
+    logger.fatal('CRITICAL: connectAri called without a valid AI input handler.');
+    process.exit(1);
+  }
+  aiInputHandlerAri = handler;
+
+  if (ariClientInstance) {
+    return ariClientInstance;
   }
 
   try {
-    loadStateConfig(); // Asegurar que la config FSM esté cargada y validada.
+    loadStateConfig();
+    logger.info({ url: ARI_URL, user: ARI_USERNAME }, 'ARI: Attempting to connect...');
+    const client = await Ari.connect(ARI_URL, ARI_USERNAME, ARI_PASSWORD);
+    logger.info(`ARI: Connected to Asterisk on ${ARI_URL}`);
+    ariClientInstance = client;
 
-    ariClient = await Ari.connect(ARI_URL, ARI_USERNAME, ARI_PASSWORD);
-    console.log(`ARI: Conectado a Asterisk en ${ARI_URL}`);
+    client.on('StasisStart', (event, channel) => {
+      // Register DTMF handler for this specific channel
+      channel.on('ChannelDtmfReceived', (dtmfEvent, dtmfChannel) => {
+        handleDtmfReceived(dtmfEvent, dtmfChannel);
+      });
+      handleStasisStart(event, channel);
+    });
+    client.on('StasisEnd', handleStasisEnd);
 
-    ariClient.on('StasisStart', handleStasisStart);
-    ariClient.on('StasisEnd', handleStasisEnd);
-
-    // Podríamos necesitar más handlers, por ejemplo:
-    // ariClient.on('StasisDTMFReceived', handleDtmf);
-    // ariClient.on('ChannelHangupRequest', handleHangup);
-    // ariClient.on('ChannelStateChange', (event, channel) => { ... });
-
-    ariClient.on('error', (err) => {
-      console.error('ARI: Error de conexión o runtime:', err);
-      ariClient = null; // Permitir reconexión
-      // Implementar lógica de reconexión si es necesario
-      setTimeout(connectAri, 5000); // Reintentar conexión después de 5 segundos
+    client.on('error', (err) => {
+      logger.error({ err }, 'ARI: Client-level error.');
+      ariClientInstance = null; // Reset for reconn
+      setTimeout(() => connectAri(aiInputHandlerAri), 5000); // Reconnect after 5s
     });
 
-    ariClient.on('close', () => {
-        console.log('ARI: Conexión con Asterisk cerrada.');
-        ariClient = null;
-        // Podrías intentar reconectar aquí si es deseado.
-        // setTimeout(connectAri, 5000); // Ejemplo de reintento
+    client.on('close', () => {
+      logger.info('ARI: Connection to Asterisk closed.');
+      ariClientInstance = null;
+      if (process.env.ENABLE_ARI !== 'false') { // Only reconnect if ARI is supposed to be enabled
+        setTimeout(() => connectAri(aiInputHandlerAri), 5000);
+      }
     });
 
-    await ariClient.start(ARI_APP_NAME);
-    console.log(`ARI: Aplicación Stasis "${ARI_APP_NAME}" registrada y escuchando.`);
-
-    return ariClient;
+    await client.start(ARI_APP_NAME);
+    logger.info(`ARI: Stasis app "${ARI_APP_NAME}" registered and listening.`);
+    return client;
 
   } catch (err) {
-    console.error(`ARI: No se pudo conectar o iniciar la aplicación Stasis:`, err);
-    ariClient = null;
-    // Reintentar conexión si falla al inicio
-    console.log('ARI: Reintentando conexión en 10 segundos...');
-    setTimeout(connectAri, 10000);
-    throw err; // Lanzar para que el inicio general de la app pueda manejarlo si es el primer intento.
+    logger.error({ err }, `ARI: Failed to connect or start Stasis app.`);
+    ariClientInstance = null;
+    if (process.env.ENABLE_ARI !== 'false') {
+      logger.info('ARI: Retrying connection in 10 seconds...');
+      setTimeout(() => connectAri(aiInputHandlerAri), 10000);
+    }
+    // Do not throw here if main startup should continue with other modules
   }
 }
 
-/**
- * Cierra la conexión ARI de forma controlada.
- */
 async function closeAri() {
-  if (ariClient) {
-    console.log('ARI: Cerrando conexión con Asterisk...');
+  if (ariClientInstance) {
+    logger.info('ARI: Closing connection to Asterisk...');
     try {
-      // No hay un método explícito 'stop' para la app en todas las versiones de cliente,
-      // pero cerrar el cliente debería ser suficiente.
-      await ariClient.close();
-      console.log('ARI: Conexión con Asterisk cerrada.');
+      // Stop the Stasis app. This might not be strictly necessary if client.close() handles it.
+      // await ariClientInstance.applications.unsubscribe({applicationName: ARI_APP_NAME});
+      await ariClientInstance.close();
+      logger.info('ARI: Connection to Asterisk closed.');
     } catch (err) {
-      console.error('ARI: Error al cerrar la conexión con Asterisk:', err);
+      logger.error({ err }, 'ARI: Error during close.');
     } finally {
-      ariClient = null;
+      ariClientInstance = null;
     }
   }
 }
@@ -192,6 +218,4 @@ async function closeAri() {
 module.exports = {
   connectAri,
   closeAri,
-  // Podríamos exportar el cliente si otras partes de la app lo necesitan
-  // getAriClient: () => ariClient
 };

@@ -1,154 +1,165 @@
 const net = require('net');
 const fs = require('fs');
+const logger = require('./logger'); // Use pino logger
+const redisClient = require('./redisClient'); // For logging FSM output
 
 let server;
+let aiInputHandlerSocket; // Placeholder for the AI input handler
 
 /**
  * Inicia el servidor de sockets UNIX.
  * @param {string} socketPath La ruta del archivo de socket UNIX.
- * @param {function} fsmProcessInputCallback Callback para procesar los mensajes de la FSM.
- *                                           Debe ser una función async que acepte (sessionId, intent, parameters)
- *                                           y devuelva una promesa que resuelva con el resultado de la FSM.
+ * @param {function} handler Callback para procesar los mensajes (ahora el AI handler).
  */
-function startSocketServer(socketPath, fsmProcessInputCallback) {
+function startSocketServer(socketPath, handler) {
+  if (typeof handler !== 'function') {
+    logger.fatal('CRITICAL: startSocketServer called without a valid AI input handler.');
+    process.exit(1);
+  }
+  aiInputHandlerSocket = handler;
+
   if (!socketPath) {
-    console.error('Socket Server: FSM_SOCKET_PATH no está definido. El servidor de sockets no se iniciará.');
+    logger.error('Socket Server: FSM_SOCKET_PATH no está definido. El servidor de sockets no se iniciará.');
     return;
   }
 
-  // Eliminar el socket antiguo si existe
   if (fs.existsSync(socketPath)) {
     try {
       fs.unlinkSync(socketPath);
-      console.log(`Socket Server: Eliminado socket antiguo en ${socketPath}`);
+      logger.info(`Socket Server: Eliminado socket antiguo en ${socketPath}`);
     } catch (err) {
-      console.error(`Socket Server: Error al eliminar socket antiguo ${socketPath}:`, err);
-      // No continuar si no se puede eliminar el socket antiguo, ya que listen fallará.
+      logger.error({ err, socketPath }, `Socket Server: Error al eliminar socket antiguo ${socketPath}`);
       return;
     }
   }
 
   server = net.createServer((socket) => {
-    console.log('Socket Server: Cliente conectado.');
-    let RsessionId = null; // Para logging en caso de error de parseo
+    logger.info('Socket Server: Cliente conectado.');
+    let RsessionId = null; // Para logging en caso de error de parseo o si falta sessionId
 
     socket.on('data', async (data) => {
-      const message = data.toString();
-      // No imprimir 'message' directamente aquí si va a ser parseado y luego impreso formateado.
-      // console.log('Socket Server: Datos recibidos (raw):', message);
+      const message = data.toString().trim(); // Trim to remove potential newlines from client
+      if (!message) {
+        logger.warn('Socket Server: Received empty message.');
+        return;
+      }
+
+      let requestPayload;
+      let sessionIdFromPayload;
+      let textInputFromPayload;
 
       try {
-        const request = JSON.parse(message);
-        RsessionId = request.sessionId; // Guardar para logging
+        // Expecting JSON: { "sessionId": "xxx", "textInput": "user says something" }
+        requestPayload = JSON.parse(message);
+        sessionIdFromPayload = requestPayload.sessionId;
+        textInputFromPayload = requestPayload.textInput;
+        RsessionId = sessionIdFromPayload; // For logging outside this try block
 
-        const capturedRequest = { ...request }; // Clonar para log diferido
-        process.nextTick(() => {
-          console.log("Socket Request JSON (async log):\n", JSON.stringify(capturedRequest, null, 2));
-        });
+        logger.debug({ sessionId: RsessionId, request: requestPayload }, 'Socket Server: Datos JSON recibidos');
 
-        if (!request.sessionId) {
-          throw new Error('sessionId es requerido en la solicitud del socket.');
+        if (!sessionIdFromPayload || typeof sessionIdFromPayload !== 'string') {
+          throw new Error('sessionId es requerido y debe ser un string en la solicitud del socket.');
+        }
+        if (!textInputFromPayload || typeof textInputFromPayload !== 'string') {
+          throw new Error('textInput es requerido y debe ser un string en la solicitud del socket.');
         }
 
-        const fsmResponse = await fsmProcessInputCallback(
-          request.sessionId,
-          request.intent,
-          request.parameters
-        );
+        // Delegate to the central AI input handler
+        const fsmResult = await aiInputHandlerSocket(sessionIdFromPayload, textInputFromPayload, 'socket');
 
-        // Enviar respuesta inmediatamente
-        socket.write(JSON.stringify(fsmResponse) + '\n');
-
-        // Loguear respuesta de forma diferida
-        const capturedResponse = { ...fsmResponse }; // Clonar por si acaso
-        process.nextTick(() => {
-          console.log("Socket Response JSON (async log):\n", JSON.stringify(capturedResponse, null, 2));
-        });
-
-      } catch (error) {
-        console.error(`Socket Server: Error procesando mensaje para sessionId ${RsessionId || 'desconocido'} (mensaje original: ${message.substring(0,100)}...):`, error.message);
-        const errorResponse = {
-          error: error.message,
-          // details: error.stack, // Omitir stack en producción o hacerlo condicional
+        // Construct the response expected by the client
+        const responseObject = {
+          sessionId: sessionIdFromPayload,
+          currentStateId: fsmResult.sessionData.currentStateId,
+          nextStateId: fsmResult.nextStateId,
+          parametersToCollect: fsmResult.parametersToCollect,
+          payloadResponse: fsmResult.payloadResponse,
+          collectedParameters: fsmResult.sessionData.parameters,
         };
 
-        // Intentar enviar error inmediatamente
+        socket.write(JSON.stringify(responseObject) + '\n');
+
+        // Log FSM output for socket to Redis
+        redisClient.set(`socket_fsm_output:${sessionIdFromPayload}:${Date.now()}`, JSON.stringify(responseObject), 'EX', 3600)
+            .catch(err => logger.error({ err, sessionId: sessionIdFromPayload }, 'Failed to log Socket FSM output to Redis'));
+
+
+      } catch (error) {
+        logger.error({ err: error, sessionId: RsessionId, rawMessage: message.substring(0, 200) },
+          `Socket Server: Error procesando mensaje para sessionId ${RsessionId || 'desconocido'}`);
+
+        const errorResponse = {
+          error: error.message,
+          sessionId: RsessionId || null,
+        };
         try {
           socket.write(JSON.stringify(errorResponse) + '\n');
         } catch (writeError) {
-            console.error('Socket Server: Error escribiendo respuesta de error al socket:', writeError);
+            logger.error({ err: writeError }, 'Socket Server: Error escribiendo respuesta de error al socket');
         }
-
-        // Loguear error de forma diferida
-        process.nextTick(() => {
-          console.log("Socket Error Response JSON (async log):\n", JSON.stringify(errorResponse, null, 2));
-        });
       }
     });
 
     socket.on('end', () => {
-      console.log('Socket Server: Cliente desconectado.');
+      logger.info({ sessionId: RsessionId }, 'Socket Server: Cliente desconectado.');
     });
 
     socket.on('error', (err) => {
-      // No loguear errores ECONNRESET que son comunes cuando el cliente cierra abruptamente.
-      if (err.code !== 'ECONNRESET') {
-        console.error('Socket Server: Error en el socket del cliente:', err);
+      if (err.code !== 'ECONNRESET') { // ECONNRESET is common, client closed abruptly
+        logger.error({ err, sessionId: RsessionId }, 'Socket Server: Error en el socket del cliente.');
+      } else {
+        logger.warn({ sessionId: RsessionId }, 'Socket Server: Cliente cerró conexión abruptamente (ECONNRESET).');
       }
     });
   });
 
   server.on('error', (err) => {
-    console.error('Socket Server: Error del servidor:', err);
-    // Si el error es EADDRINUSE, podría ser que fs.unlinkSync no funcionó a tiempo
-    // o hay otro proceso.
+    logger.error({ err, socketPath }, 'Socket Server: Error del servidor.');
     if (err.code === 'EADDRINUSE') {
-        console.error(`Socket Server: La dirección ${socketPath} ya está en uso. Asegúrese de que no haya otro servidor corriendo o elimine el archivo de socket manualmente.`);
+        logger.error(`Socket Server: La dirección ${socketPath} ya está en uso.`);
     }
   });
 
   server.listen(socketPath, () => {
-    console.log(`Socket Server: Escuchando en ${socketPath}`);
-    // Asegurar permisos correctos para el socket si es necesario (ej: 0o660 o 0o666)
-    // fs.chmodSync(socketPath, 0o666); // Ejemplo, ajustar según necesidades de seguridad
+    logger.info(`Socket Server: Escuchando en ${socketPath}`);
+    try {
+      fs.chmodSync(socketPath, 0o666); // Permisos para que otros usuarios puedan acceder
+      logger.info(`Socket Server: Permisos de ${socketPath} establecidos a 666.`);
+    } catch (chmodError) {
+      logger.error({ err: chmodError, socketPath }, `Socket Server: Error al establecer permisos para ${socketPath}.`);
+    }
   });
 
-  // Manejar la limpieza del socket al salir
-  // Esto se hace también en index.js, pero es bueno tenerlo aquí por si el módulo se usa diferente
-  process.on('exit', () => {
+  process.on('exit', () => { // Ensure cleanup on exit
     stopSocketServer(socketPath);
   });
 }
 
-/**
- * Detiene el servidor de sockets UNIX y elimina el archivo de socket.
- * @param {string} socketPath La ruta del archivo de socket UNIX.
- */
+
 function stopSocketServer(socketPath) {
   return new Promise((resolve) => {
     if (server) {
-      console.log('Socket Server: Cerrando servidor de sockets...');
+      logger.info('Socket Server: Cerrando servidor de sockets...');
       server.close(() => {
-        console.log('Socket Server: Servidor de sockets cerrado.');
+        logger.info('Socket Server: Servidor de sockets cerrado.');
         if (socketPath && fs.existsSync(socketPath)) {
           try {
             fs.unlinkSync(socketPath);
-            console.log(`Socket Server: Eliminado archivo de socket ${socketPath}`);
+            logger.info(`Socket Server: Eliminado archivo de socket ${socketPath}`);
           } catch (err) {
-            console.error(`Socket Server: Error al eliminar archivo de socket ${socketPath} al cerrar:`, err);
+            logger.error({ err, socketPath }, `Socket Server: Error al eliminar archivo de socket ${socketPath} al cerrar`);
           }
         }
         server = null;
         resolve();
       });
     } else {
-      // Si el servidor no está definido pero el path sí, intentar limpiar por si acaso
       if (socketPath && fs.existsSync(socketPath)) {
         try {
           fs.unlinkSync(socketPath);
-          console.log(`Socket Server: Eliminado archivo de socket huérfano ${socketPath}`);
+          logger.info(`Socket Server: Eliminado archivo de socket huérfano ${socketPath}`);
         } catch (err) {
-          // No hacer mucho ruido si falla, podría no ser nuestro socket
+          // Silently fail if it's not our socket or already gone
         }
       }
       resolve();

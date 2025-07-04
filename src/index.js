@@ -1,125 +1,217 @@
 require('dotenv').config(); // Cargar variables de entorno desde .env al inicio
 
+require('dotenv').config(); // Cargar variables de entorno desde .env al inicio
+
+const fs = require('fs');
+const path = require('path');
+const logger = require('./logger'); // Usar pino logger
 const { startApiServer } = require('./apiServer');
-const { startSocketServer, stopSocketServer } = require('./socketServer'); // Nuevo
+const { startSocketServer, stopSocketServer } = require('./socketServer');
 const redisClient = require('./redisClient');
 const { connectAri, closeAri } = require('./ariClient');
-const fsm = require('./fsm'); // Necesario para pasar processInput
+const fsm = require('./fsm');
 const { loadStateConfig } = require('./configLoader');
+const aiService = require('./aiService'); // Import AI Service
+const jsonValidator = require('./jsonValidator'); // Import JSON Validator
+const { validateAIResponse: customAIResponseValidator } = require('../config/customAIResponseValidator'); // Import custom validator
+
+const PROMPT_PATH = path.join(__dirname, '../config/aiPrompt.txt');
+let aiPromptContent = '';
+
+function loadAIPrompt() {
+  try {
+    if (fs.existsSync(PROMPT_PATH)) {
+      aiPromptContent = fs.readFileSync(PROMPT_PATH, 'utf-8');
+      logger.info('AI prompt content loaded successfully.');
+    } else {
+      logger.error(`AI prompt file not found at ${PROMPT_PATH}. AI processing will likely fail.`);
+      aiPromptContent = ''; // Ensure it's empty if not found
+    }
+  } catch (error) {
+    logger.error({ err: error, promptPath: PROMPT_PATH }, 'Error loading AI prompt file.');
+    aiPromptContent = '';
+  }
+}
+
+async function handleInputWithAI(sessionId, textInput, source) {
+  logger.info({ sessionId, textInputLength: textInput?.length, source }, 'Handling input with AI');
+  await redisClient.set(`input_text:${sessionId}:${Date.now()}`, JSON.stringify({ textInput, source }), 'EX', 3600)
+    .catch(err => logger.error({ err }, 'Failed to log input_text to Redis'));
+
+  if (!aiPromptContent) {
+    logger.error({ sessionId, source }, 'AI prompt is not loaded. Cannot process AI response.');
+    // Fallback: Try to pass input directly to FSM if it looks like JSON, or use a default
+    try {
+        const parsedInput = JSON.parse(textInput);
+        if (parsedInput.intent && parsedInput.parameters) {
+            logger.warn({sessionId, source }, "AI prompt missing, but input was valid JSON. Proceeding with input as FSM params.");
+            await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(parsedInput), 'EX', 3600)
+              .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (fallback)'));
+            return fsm.processInput(sessionId, parsedInput.intent, parsedInput.parameters);
+        }
+    } catch (e) {
+        // Not JSON, or not the right structure
+    }
+    // Default fallback: use a generic intent or error state
+    logger.warn({sessionId, source}, "AI prompt missing and input not usable. Using default 'general_inquiry'.");
+    const fallbackFsmInput = { intent: 'general_inquiry', parameters: { raw_text: textInput } };
+    await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
+        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (default fallback)'));
+    return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+  }
+
+  let aiJsonResponse;
+  try {
+    aiJsonResponse = await aiService.getAIResponse(textInput, aiPromptContent);
+    // aiService already logs its input/output to Redis
+  } catch (aiError) {
+    logger.error({ err: aiError, sessionId, textInput, source }, 'AI service failed to get response.');
+    // Fallback to a generic intent if AI fails
+    const fallbackFsmInput = { intent: 'ai_processing_error', parameters: { error: aiError.message, original_text: textInput } };
+    await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
+        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (AI error fallback)'));
+    return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+  }
+
+  // Schema Validation
+  const schemaValidationResult = jsonValidator.validateJson(aiJsonResponse);
+  if (!schemaValidationResult.isValid) {
+    logger.warn({ sessionId, errors: schemaValidationResult.errors, aiResponse: aiJsonResponse, source }, 'AI response failed JSON schema validation.');
+    // Fallback or error handling for schema validation failure
+    const fallbackFsmInput = { intent: 'ai_schema_validation_error', parameters: { errors: schemaValidationResult.errors, original_response: aiJsonResponse } };
+    await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
+        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (schema error fallback)'));
+    return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+  }
+
+  // Custom Validation
+  let finalAiResponse = aiJsonResponse;
+  if (typeof customAIResponseValidator === 'function') {
+    const customValidationResult = customAIResponseValidator(aiJsonResponse);
+    if (!customValidationResult.isValid) {
+      logger.warn({ sessionId, message: customValidationResult.message, aiResponse: aiJsonResponse, source }, 'AI response failed custom validation.');
+      // Fallback or error handling for custom validation failure
+      const fallbackFsmInput = { intent: 'ai_custom_validation_error', parameters: { error_message: customValidationResult.message, original_response: aiJsonResponse } };
+      await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
+        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (custom validation error fallback)'));
+      return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+    }
+    if (customValidationResult.validatedResponse) {
+      finalAiResponse = customValidationResult.validatedResponse;
+      logger.info({sessionId, source}, "AI response was modified by custom validator.");
+    }
+  }
+
+  logger.info({ sessionId, intent: finalAiResponse.intent, parameters: finalAiResponse.parameters, source }, 'AI response validated, proceeding to FSM.');
+
+  await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(finalAiResponse), 'EX', 3600)
+    .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis'));
+
+  const fsmResult = await fsm.processInput(sessionId, finalAiResponse.intent, finalAiResponse.parameters);
+
+  // FSM output is logged by FSM itself or by the calling interface (apiServer, etc.)
+  // For consistency, let's ensure it's logged here too if not elsewhere.
+  // fsm.processInput now returns sessionData which includes the output.
+  // The actual response sent to the client (apiServer, socketServer) will be logged there.
+  // Here we log what FSM produced internally.
+  await redisClient.set(`fsm_output:${sessionId}:${Date.now()}`, JSON.stringify(fsmResult), 'EX', 3600)
+    .catch(err => logger.error({ err }, 'Failed to log fsm_output to Redis'));
+
+  return fsmResult;
+}
+
 
 async function main() {
-  console.log(`Valor de process.env.ENABLE_API: ${process.env.ENABLE_API}`);
-  console.log(`Valor de process.env.ENABLE_ARI: ${process.env.ENABLE_ARI}`);
-  console.log(`Valor de process.env.ENABLE_SOCKET_SERVER: ${process.env.ENABLE_SOCKET_SERVER}`);
-  console.log(`Valor de process.env.FSM_SOCKET_PATH: ${process.env.FSM_SOCKET_PATH}`);
+  logger.info(`Valor de process.env.ENABLE_API: ${process.env.ENABLE_API}`);
+  logger.info(`Valor de process.env.ENABLE_ARI: ${process.env.ENABLE_ARI}`);
+  logger.info(`Valor de process.env.ENABLE_SOCKET_SERVER: ${process.env.ENABLE_SOCKET_SERVER}`);
+  logger.info(`Valor de process.env.FSM_SOCKET_PATH: ${process.env.FSM_SOCKET_PATH}`);
+  logger.info(`Valor de process.env.AI_PROVIDER: ${process.env.AI_PROVIDER}`);
 
   let ariConnected = false;
   let socketServerStarted = false;
 
   try {
-    // 1. Cargar configuración de la FSM (ya se hace en apiServer y ariClient al iniciar, pero podemos asegurar aquí)
-    console.log('Inicializando aplicación FSM...');
-    loadStateConfig();
-    console.log('Configuración de estados cargada.');
+    logger.info('Inicializando aplicación FSM...');
+    loadStateConfig(); // FSM states
+    jsonValidator.loadSchema(); // AI Response JSON Schema
+    loadAIPrompt(); // AI Prompt
 
-    // 2. Conectar a Redis
     await redisClient.connect();
-    console.log('Conexión con Redis establecida.');
+    logger.info('Conexión con Redis establecida.');
 
-    // 3. Iniciar el servidor API
-    // startApiServer ya maneja su propia carga de config y logging
-    const enableApi = process.env.ENABLE_API !== 'false'; // Habilitado por defecto
+    const enableApi = process.env.ENABLE_API !== 'false';
     if (enableApi) {
-      startApiServer();
-      // No hay un 'await' aquí porque app.listen es asíncrono pero no devuelve una promesa
-      // que necesitemos esperar para continuar. El log de 'escuchando en puerto X'
-      // se manejará dentro de startApiServer.
+      startApiServer(handleInputWithAI); // Pass the AI handler
     } else {
-      console.log('Módulo API está deshabilitado por configuración (ENABLE_API=false).');
+      logger.info('Módulo API está deshabilitado por configuración (ENABLE_API=false).');
     }
 
-    // 4. Conectar al cliente ARI de Asterisk (si está habilitado o configurado)
-    const enableAri = process.env.ENABLE_ARI !== 'false'; // Habilitado por defecto
+    const enableAri = process.env.ENABLE_ARI !== 'false';
     if (enableAri) {
-      console.log('Intentando conectar a Asterisk ARI...');
-      await connectAri(); // connectAri maneja sus propios reintentos iniciales si falla
-      ariConnected = true; // Marcar como conectado solo si se intentó y tuvo éxito (o está en proceso)
-      console.log('Módulo ARI iniciado (o intentando conectar).');
+      logger.info('Intentando conectar a Asterisk ARI...');
+      await connectAri(handleInputWithAI); // Pass the AI handler
+      ariConnected = true;
+      logger.info('Módulo ARI iniciado (o intentando conectar).');
     } else {
-      console.log('Módulo ARI está deshabilitado por configuración (ENABLE_ARI=false).');
+      logger.info('Módulo ARI está deshabilitado por configuración (ENABLE_ARI=false).');
     }
 
-    // 5. Iniciar el servidor de Sockets UNIX (si está habilitado)
-    const enableSocketServer = process.env.ENABLE_SOCKET_SERVER !== 'false'; // Habilitado por defecto
+    const enableSocketServer = process.env.ENABLE_SOCKET_SERVER !== 'false';
     const fsmSocketPath = process.env.FSM_SOCKET_PATH;
     if (enableSocketServer) {
       if (fsmSocketPath) {
-        startSocketServer(fsmSocketPath, fsm.processInput);
+        startSocketServer(fsmSocketPath, handleInputWithAI); // Pass the AI handler
         socketServerStarted = true;
       } else {
-        console.warn('ADVERTENCIA: ENABLE_SOCKET_SERVER está en true, pero FSM_SOCKET_PATH no está definido. El servidor de sockets no se iniciará.');
+        logger.warn('ADVERTENCIA: ENABLE_SOCKET_SERVER está en true, pero FSM_SOCKET_PATH no está definido. El servidor de sockets no se iniciará.');
       }
     } else {
-      console.log('Módulo Socket Server está deshabilitado por configuración (ENABLE_SOCKET_SERVER=false).');
+      logger.info('Módulo Socket Server está deshabilitado por configuración (ENABLE_SOCKET_SERVER=false).');
     }
 
-
     if (enableApi || enableAri || socketServerStarted) {
-      console.log('Aplicación FSM iniciada y lista (al menos un módulo de interfaz está activo).');
+      logger.info('Aplicación FSM iniciada y lista (al menos un módulo de interfaz está activo).');
     } else {
-      console.warn('ADVERTENCIA: Todos los módulos de interfaz (API, ARI, Socket) están deshabilitados. La aplicación no podrá recibir solicitudes.');
-      // Podríamos optar por salir si ningún módulo está activo, o dejarla corriendo "ociosa".
-      // Por ahora, la dejamos correr.
+      logger.warn('ADVERTENCIA: Todos los módulos de interfaz (API, ARI, Socket) están deshabilitados. La aplicación no podrá recibir solicitudes.');
     }
 
   } catch (error) {
-    console.error('Error fatal durante la inicialización de la aplicación:', error);
-    // Intentar cerrar conexiones abiertas antes de salir
-    if (ariConnected && process.env.ENABLE_ARI !== 'false') { // Solo cerrar si estaba habilitado e intentó conectar
-      await closeAri().catch(err => console.error('Error al cerrar ARI durante el apagado por error:', err));
+    logger.fatal({ err: error }, 'Error fatal durante la inicialización de la aplicación');
+    if (ariConnected && process.env.ENABLE_ARI !== 'false') {
+      await closeAri().catch(err => logger.error({ err }, 'Error al cerrar ARI durante el apagado por error'));
     }
-    if (socketServerStarted && process.env.ENABLE_SOCKET_SERVER !== 'false') { // Solo cerrar si estaba habilitado e intentó conectar
-      await stopSocketServer(process.env.FSM_SOCKET_PATH).catch(err => console.error('Error al cerrar Socket Server durante el apagado por error:', err));
+    if (socketServerStarted && process.env.ENABLE_SOCKET_SERVER !== 'false') {
+      await stopSocketServer(process.env.FSM_SOCKET_PATH).catch(err => logger.error({ err }, 'Error al cerrar Socket Server durante el apagado por error'));
     }
-    await redisClient.quit().catch(err => console.error('Error al cerrar Redis durante el apagado por error:', err));
+    await redisClient.quit().catch(err => logger.error({ err }, 'Error al cerrar Redis durante el apagado por error'));
     process.exit(1);
   }
 }
 
-// Manejar cierre gracefully
 async function shutdown(signal) {
-  console.log(`\nRecibida señal ${signal}. Cerrando la aplicación FSM...`);
+  logger.info(`\nRecibida señal ${signal}. Cerrando la aplicación FSM...`);
 
-  // Aquí no cerramos el servidor HTTP explícitamente con server.close()
-  // porque no guardamos la instancia del servidor desde startApiServer.
-  // Para un cierre más limpio, startApiServer debería devolver el servidor.
-  // Por ahora, las conexiones existentes podrían interrumpirse si la API estaba activa.
-
-  if (process.env.ENABLE_ARI !== 'false') { // Solo intentar cerrar si estaba habilitado
-      await closeAri().catch(err => console.error('Error al cerrar ARI:', err));
+  if (process.env.ENABLE_ARI !== 'false') {
+      await closeAri().catch(err => logger.error({ err }, 'Error al cerrar ARI'));
   }
-  if (process.env.ENABLE_SOCKET_SERVER !== 'false' && process.env.FSM_SOCKET_PATH) { // Solo intentar cerrar si estaba habilitado y con path
-      await stopSocketServer(process.env.FSM_SOCKET_PATH).catch(err => console.error('Error al cerrar Socket Server:', err));
+  if (process.env.ENABLE_SOCKET_SERVER !== 'false' && process.env.FSM_SOCKET_PATH) {
+      await stopSocketServer(process.env.FSM_SOCKET_PATH).catch(err => logger.error({ err }, 'Error al cerrar Socket Server'));
   }
-  await redisClient.quit().catch(err => console.error('Error al cerrar Redis:', err));
+  await redisClient.quit().catch(err => logger.error({ err }, 'Error al cerrar Redis'));
 
-  console.log('Aplicación FSM cerrada.');
+  logger.info('Aplicación FSM cerrada.');
   process.exit(0);
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('uncaughtException', (error) => {
-  console.error('Excepción no capturada:', error);
-  // Considera si quieres intentar un shutdown aquí o simplemente salir.
-  // Si el estado es muy inestable, un shutdown podría fallar o empeorar las cosas.
-  // shutdown('uncaughtException').then(() => process.exit(1)).catch(() => process.exit(1));
-  process.exit(1); // Salir directamente para evitar estado inconsistente
+  logger.fatal({ err: error }, 'Excepción no capturada');
+  process.exit(1);
 });
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Rechazo de promesa no manejado:', promise, 'razón:', reason);
-  // Similar a uncaughtException, decide la estrategia de salida.
-  // shutdown('unhandledRejection').then(() => process.exit(1)).catch(() => process.exit(1));
+  logger.fatal({ reason, promise }, 'Rechazo de promesa no manejado');
   process.exit(1);
 });
 

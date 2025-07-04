@@ -1,87 +1,127 @@
-# Documento de Funcionamiento y Casos de Uso del Servicio FSM
+# Documento de Funcionamiento y Casos de Uso del Servicio FSM con IA
 
-## 1. Introducción al Servicio FSM
+## 1. Introducción al Servicio FSM con IA
 
-Este servicio de Máquina de Estados Finitos (FSM) está diseñado para gestionar flujos conversacionales complejos de manera estructurada y configurable. Su propósito principal es orquestar la lógica de una conversación entre un usuario y un sistema (por ejemplo, un agente virtual para agendamiento de citas), determinando el siguiente paso de la conversación, los datos que deben recolectarse y las acciones (APIs externas) que deben ejecutarse.
+Este servicio de Máquina de Estados Finitos (FSM) ahora integra un **procesamiento de lenguaje natural mediante Inteligencia Artificial (IA)** para interpretar la entrada del usuario antes de que la FSM actúe. Su propósito es orquestar flujos conversacionales complejos, donde la IA primero estructura la entrada del usuario (texto) en una intención (`intent`) y parámetros (`parameters`), y luego la FSM gestiona el diálogo basado en esta información estructurada.
 
 **Integración:**
-El servicio FSM puede ser integrado de dos maneras principales:
-*   **API RESTful (JSON):** A través de un endpoint HTTP que recibe y devuelve información en formato JSON. Es ideal para aplicaciones de chat, frontends web, o cualquier sistema que pueda realizar solicitudes HTTP.
-*   **Asterisk ARI (Asterisk REST Interface):** Permite la integración con sistemas de telefonía basados en Asterisk, controlando el flujo de llamadas de voz.
+El servicio puede ser integrado a través de:
+*   **API RESTful (Texto Plano -> JSON):** A través de un endpoint HTTP (`POST /fsm/:sessionId`) que ahora recibe **texto plano** (`text/plain`). Este texto es procesado por la IA, y el JSON resultante alimenta a la FSM. La respuesta final de la FSM se devuelve como JSON.
+*   **Sockets UNIX (JSON con Texto -> JSON):** El cliente envía un JSON con `sessionId` y `textInput`. `textInput` es procesado por la IA. La respuesta de la FSM se devuelve como JSON.
+*   **Asterisk ARI (Voz/DTMF -> Texto -> JSON):** La entrada de voz (requiere ASR externa o DTMF interpretado) se convierte en texto, se procesa por la IA, y luego la FSM guía la llamada.
 
 **Componentes Clave:**
-*   **Motor FSM (`src/fsm.js`):** El núcleo lógico que procesa las entradas, gestiona las transiciones entre estados y mantiene el estado de la sesión.
-*   **Configuración de Estados (`config/states.json`):** Un archivo JSON externo que define todos los estados posibles de la conversación, las transiciones entre ellos, los parámetros requeridos/opcionales para cada estado, y los "ganchos" de API (`apiHooks`) a ejecutar en diferentes puntos del ciclo de vida de un estado.
-*   **Redis (`src/redisClient.js`):** Utilizado como almacén de persistencia para las sesiones de conversación. Cada sesión activa tiene su estado actual y parámetros acumulados guardados en Redis, permitiendo conversaciones multivuelta y recuperación.
+*   **Servicio de IA (`src/aiService.js`):** (NUEVO) Interactúa con proveedores de IA (OpenAI, Google Gemini, Groq) usando un prompt (`config/aiPrompt.txt`) para convertir el texto del usuario en un JSON con `intent` y `parameters`.
+*   **Validación de IA (`src/jsonValidator.js`, `config/aiResponseSchema.json`, `config/customAIResponseValidator.js`):** (NUEVO) Valida la salida de la IA.
+*   **Motor FSM (`src/fsm.js`):** El núcleo lógico que procesa la `intent` y `parameters` (ahora provenientes de la IA), gestiona transiciones y mantiene el estado de la sesión.
+*   **Configuración de Estados (`config/states.json`):** Define los estados y la lógica de la FSM.
+*   **Redis (`src/redisClient.js`):** Almacena sesiones FSM y logs de interacciones de IA y FSM.
+*   **Logging (`src/logger.js`):** (NUEVO) Logging estructurado con `pino`.
 
-## 2. Arquitectura General
-
-A continuación, se presenta un diagrama de la arquitectura general del sistema:
+## 2. Arquitectura General Actualizada
 
 ```mermaid
 graph LR
     subgraph ClienteExApp [Aplicación Cliente Externa]
         direction LR
-        C[Cliente UI / Chatbot / IVR]
+        C[Cliente UI / Chatbot / IVR] -- Texto Plano / JSON con Texto --> INTERFACE
     end
 
-    subgraph ServicioFSM [Servicio FSM Node.js]
+    subgraph ServicioFSM_IA [Servicio FSM Node.js con IA]
         direction TB
-        API[Servidor API Express: POST /fsm/:sessionId]
-        FSM[Motor FSM: fsm.js]
-        CONF[Config Loader: configLoader.js]
-        REDISC[Cliente Redis: redisClient.js]
-        ARIC[Cliente ARI: ariClient.js] -- Optional --> ASTERISK[Servidor Asterisk]
+        INTERFACE[API / Socket / ARI Handler] --> AISVC[AI Service: aiService.js]
+        AISVC -- Prompt de config/aiPrompt.txt --> AIPROV[Proveedor IA Externo: OpenAI/Google/Groq]
+        AIPROV -- JSON crudo --> AISVC
+        AISVC -- JSON crudo --> VALIDATOR[Validador IA: jsonValidator.js + customAIResponseValidator.js]
+        VALIDATOR -- JSON validado (intent, params) --> FSM[Motor FSM: fsm.js]
+        FSM -- Definición de config/states.json & templateProcessor.js --> FSM
+        FSM --> REDISC[Cliente Redis: redisClient.js]
+        REDISC --> REDIS_DB[Base de Datos Redis]
+        FSM -- Respuesta FSM (payloadResponse, etc.) --> INTERFACE
+        INTERFACE -- Respuesta JSON Final --> C
     end
-
-    subgraph Infraestructura
-        direction TB
-        STATES_JSON[config/states.json]
-        REDIS_DB[Base de Datos Redis]
-    end
-
-    C --> API
-    API --> FSM
-    FSM --> CONF
-    FSM --> REDISC
-    CONF --> STATES_JSON
-    REDISC --> REDIS_DB
-    FSM --> ARIC
 
     style ClienteExApp fill:#dae8fc,stroke:#333,stroke-width:2px
-    style ServicioFSM fill:#d5e8d4,stroke:#333,stroke-width:2px
-    style Infraestructura fill:#ffe6cc,stroke:#333,stroke-width:2px
+    style ServicioFSM_IA fill:#d5e8d4,stroke:#333,stroke-width:2px
 ```
 
 **Flujo de Datos Simplificado:**
-1.  La **Aplicación Cliente Externa** envía una solicitud (HTTP JSON o evento ARI) al **Servicio FSM**.
-2.  El **Servidor API** (o **Cliente ARI**) recibe la solicitud y la pasa al **Motor FSM**.
-3.  El **Motor FSM** utiliza el **Config Loader** para obtener la definición del estado actual desde `config/states.json`.
-4.  El **Motor FSM** interactúa con el **Cliente Redis** para leer y escribir el estado de la sesión en la **Base de Datos Redis**.
-5.  El **Motor FSM** determina el siguiente estado, los parámetros a recolectar y los `apiHooks`.
-6.  Esta información se devuelve a la **Aplicación Cliente Externa**.
+1.  La **Aplicación Cliente Externa** envía texto de usuario al **Servicio FSM con IA** a través de una de sus interfaces.
+2.  La interfaz correspondiente pasa el texto al **AI Service**.
+3.  El **AI Service** envía el texto y un prompt al **Proveedor de IA Externo**.
+4.  El Proveedor de IA devuelve un JSON (con `intent` y `parameters`).
+5.  Este JSON es validado por el **Validador IA**.
+6.  El JSON validado se pasa como entrada al **Motor FSM**.
+7.  El **Motor FSM** procesa la entrada, interactúa con Redis para la sesión, y usa `config/states.json` y `templateProcessor.js` para generar su respuesta.
+8.  La respuesta de la FSM se devuelve a la **Aplicación Cliente Externa**.
+9.  Todas las etapas importantes (entrada de texto, E/S de IA, E/S de FSM) se registran en Redis.
 
 ## 3. Flujo de Interacción Típico
 
-### Solicitud (JSON Entrante a la API)
+### Solicitud (Entrada de Texto a la API)
 
-La aplicación externa contacta a la FSM a través de su API.
+La aplicación externa contacta al servicio.
 *   **Endpoint:** `POST /fsm/:sessionId`
-    *   `:sessionId` es un identificador único para la conversación (ej: ID de usuario, ID de canal de chat, ID de llamada).
+    *   `:sessionId` es un identificador único para la conversación.
+*   **Headers:** `Content-Type: text/plain`
 *   **Cuerpo (Body) de la Solicitud:**
+    ```
+    Hola, quiero agendar una cita para cardiología mañana a las 10 AM. Mi nombre es Juan Pérez.
+    ```
+
+### Proceso Interno (IA + FSM)
+
+1.  **Recepción y Logging Inicial**: El `apiServer.js` recibe el texto. Se registra en Redis.
+2.  **Procesamiento por IA (`aiService.js`)**:
+    *   Texto: `"Hola, quiero agendar una cita para cardiología mañana a las 10 AM. Mi nombre es Juan Pérez."`
+    *   Prompt: Contenido de `config/aiPrompt.txt`.
+    *   Salida Esperada de la IA:
+        ```json
+        {
+          "intent": "schedule_appointment",
+          "parameters": {
+            "medical_specialty": "cardiología",
+            "appointment_date": "mañana",
+            "appointment_time": "10 AM",
+            "caller_name": "Juan Pérez"
+          }
+        }
+        ```
+    *   Esta salida de la IA se registra en Redis.
+3.  **Validación de IA**: El JSON anterior se valida contra `config/aiResponseSchema.json` y `config/customAIResponseValidator.js`. Asumamos que pasa.
+4.  **Entrada a FSM**: El JSON validado se registra en Redis como `fsm_input`. Se llama a `fsm.processInput()` con `sessionId`, `intent: "schedule_appointment"`, y los `parameters` extraídos.
+5.  **Proceso FSM (`fsm.js`)**:
+    *   Recupera/Inicializa Sesión para `sessionId`.
+    *   Fusiona los `parameters` de la IA con los de la sesión.
+    *   Carga la configuración del estado actual (ej: `1_welcome_and_age`).
+    *   Evalúa Transiciones: La `intent: "schedule_appointment"` podría no causar una transición inmediata si faltan parámetros requeridos por el estado actual (como `patient_age` en `1_welcome_and_age`).
+    *   Determina `nextStateId` (ej: sigue siendo `1_welcome_and_age`).
+    *   Identifica `parametersToCollect` (ej: `required: ["patient_age"]` si `patient_age` no vino de la IA).
+    *   Procesa `payloadResponse` del estado `1_welcome_and_age` usando `templateProcessor.js` y los `collectedParameters` (que ahora incluyen `caller_name`, `medical_specialty`, etc.).
+        *   Ej: `payloadResponse: { "greeting": "Hola {{caller_name}}, bienvenido. Veo que quieres una cita para {{medical_specialty}}. Para continuar, ¿podrías decirme tu edad?" }`
+    *   Actualiza y guarda la sesión en Redis (asíncronamente).
+6.  **Respuesta (JSON Saliente de la API)**:
     ```json
     {
-      "intent": "opcional_intencion_del_usuario_o_sistema",
-      "parameters": {
-        "nombre_parametro_1": "valor_recolectado_1",
-        "nombre_parametro_2": "valor_recolectado_2"
+      "sessionId": "valor_del_sessionId_procesado",
+      "currentStateId": "1_welcome_and_age", // o el estado al que se llegó
+      "nextStateId": "1_welcome_and_age",    // o el estado al que se llegó
+      "parametersToCollect": { "required": ["patient_age"], "optional": [] },
+      "payloadResponse": {
+        "greeting": "Hola Juan Pérez, bienvenido. Veo que quieres una cita para cardiología. Para continuar, ¿podrías decirme tu edad?"
+      },
+      "collectedParameters": {
+        "caller_name": "Juan Pérez",
+        "medical_specialty": "cardiología",
+        "appointment_date": "mañana",
+        "appointment_time": "10 AM"
+        // ...otros parámetros de sesión si existían
       }
     }
     ```
-    *   `intent` (opcional): Una cadena que representa la intención del usuario (ej: "agendar_cita", "request_human_agent") o una intención generada por el sistema (ej: "id_invalid_system_detected" después de una validación fallida).
-    *   `parameters` (opcional): Un objeto que contiene los parámetros que la aplicación externa ha recolectado desde la última interacción. Para la primera interacción de una sesión, este objeto puede estar vacío o no incluirse.
+    *   Esta respuesta final también se registra en Redis.
 
-### Proceso Interno de la FSM
+### Proceso Interno de la FSM (sin cambios fundamentales en su lógica central)
 
 Al recibir una solicitud, el motor FSM realiza los siguientes pasos:
 1.  **Recuperar/Inicializar Sesión:** Usa el `sessionId` para buscar una sesión existente en Redis. Si no existe, crea una nueva sesión, estableciendo el estado actual al `initialState` definido en `config/states.json` y un objeto de parámetros vacío.
