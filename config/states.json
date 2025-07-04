@@ -1,0 +1,268 @@
+{
+  "initialState": "1_welcome_and_age",
+  "states": {
+    "1_welcome_and_age": {
+      "id": "1_welcome_and_age",
+      "description": "Dar la bienvenida al paciente y capturar su edad para definir el nivel de formalidad y verificar elegibilidad inicial.",
+      "parameters": {
+        "required": ["patient_age"],
+        "optional": ["caller_name"]
+      },
+      "payloadResponse": {
+        "greeting": "Hola {{default(caller_name, 'estimado usuario')}}, bienvenido. Hoy es {{current_date}}.",
+        "customInstructions": "Greet the user {{toUpperCase(caller_name)}} warmly and ask for their age. Current time: {{current_time}}",
+        "uiHints": { "ageInputType": "number" },
+        "apiHooks": {
+          "onEnterState": ["api_log_interaction_start"],
+          "beforeCollectingParameters": ["api_fetch_age_prompt_variations"],
+          "afterParametersCollected": ["api_check_age_eligibility", "api_log_age_provided"]
+        }
+      },
+      "transitions": [
+        {
+          "nextState": "2_get_patient_id",
+          "condition": { "allParametersMet": true }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent" }
+        },
+        {
+          "nextState": "98_age_ineligible",
+          "condition": { "intent": "age_ineligible_system_detected" }
+        }
+      ],
+      "defaultNextState": "2_get_patient_id"
+    },
+    "2_get_patient_id": {
+      "id": "2_get_patient_id",
+      "description": "Solicitar el número de identificación o cédula del paciente.",
+      "parameters": {
+        "required": ["patient_id_number"],
+        "optional": ["id_document_type"]
+      },
+      "payloadResponse": {
+        "prompts": {
+          "main": "Gracias, {{capitalize(caller_name)}}. Por favor, ingrese su número de identificación {{default(id_document_type, '')}}.",
+          "validationExample": "El formato debe ser XXXXXXXXXX."
+        },
+        "apiHooks": {
+          "onEnterState": ["api_log_enter_get_id_state"],
+          "beforeCollectingParameters": ["api_verify_id_prerequisites", "api_get_id_input_instructions"],
+          "afterParametersCollected": ["api_validate_id_format", "api_log_id_provided"]
+        }
+      },
+      "transitions": [
+        {
+          "nextState": "3_get_specialty",
+          "condition": { "allParametersMet": true }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent" }
+        },
+        {
+          "nextState": "2_get_patient_id_retry_invalid",
+          "condition": { "intent": "id_invalid_system_detected" }
+        }
+      ],
+      "defaultNextState": "3_get_specialty"
+    },
+    "3_get_specialty": {
+      "id": "3_get_specialty",
+      "description": "Preguntar por la especialidad médica requerida.",
+      "parameters": {
+        "required": ["medical_specialty"]
+      },
+      "payloadResponse": {
+        "availableSpecialtiesSource": "dynamic_via_onEnter_api",
+        "apiHooks": {
+          "onEnterState": ["api_fetch_available_specialties"],
+          "beforeCollectingParameters": [],
+          "afterParametersCollected": ["api_validate_chosen_specialty"]
+        },
+        "tools": { "specialtySelector": "dropdown" }
+      },
+      "transitions": [
+        {
+          "nextState": "4_get_office_preference",
+          "condition": { "allParametersMet": true }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent" }
+        }
+      ],
+      "defaultNextState": "4_get_office_preference"
+    },
+    "4_get_office_preference": {
+      "id": "4_get_office_preference",
+      "description": "Preguntar si tiene preferencia de oficina o si desea la más cercana/disponible.",
+      "parameters": {
+        "optional": ["preferred_office_id", "wants_nearest_office"]
+      },
+      "payloadResponse": {
+        "apiHooks": {
+          "onEnterState": ["api_fetch_offices_for_specialty"],
+          "afterParametersCollected": ["api_log_office_preference"]
+        }
+      },
+      "transitions": [
+        {
+          "nextState": "5_get_appointment_day",
+          "condition": { "allParametersMet": true }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent" }
+        }
+      ],
+      "defaultNextState": "5_get_appointment_day"
+    },
+    "5_get_appointment_day": {
+      "id": "5_get_appointment_day",
+      "description": "Pedir al paciente el día en el que desea la cita.",
+      "parameters": {
+        "required": ["appointment_date"]
+      },
+      "payloadResponse": {
+        "uiHints": { "datePickerFormat": "YYYY-MM-DD" },
+        "apiHooks": {
+          "beforeCollectingParameters": ["api_check_doctor_availability_for_day_precheck"],
+          "afterParametersCollected": ["api_validate_date_format", "api_check_doctor_availability_for_day_final"]
+        }
+      },
+      "transitions": [
+        {
+          "nextState": "6_get_appointment_time",
+          "condition": { "allParametersMet": true }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent" }
+        }
+      ],
+      "defaultNextState": "6_get_appointment_time"
+    },
+    "6_get_appointment_time": {
+      "id": "6_get_appointment_time",
+      "description": "Pedir y confirmar la hora de la cita.",
+      "parameters": {
+        "required": ["appointment_time"]
+      },
+      "payloadResponse": {
+        "apiHooks": {
+          "onEnterState": ["api_fetch_available_slots_for_day"],
+          "afterParametersCollected": ["api_book_appointment_slot"]
+        }
+      },
+      "transitions": [
+        {
+          "nextState": "7_confirmation_and_closing",
+          "condition": { "allParametersMet": true, "intent": "appointment_booked_success" }
+        },
+        {
+          "nextState": "6_retry_appointment_time",
+          "condition": { "intent": "appointment_slot_unavailable" }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent" }
+        }
+      ]
+    },
+    "7_confirmation_and_closing": {
+      "id": "7_confirmation_and_closing",
+      "description": "Confirmar todos los detalles de la cita agendada y despedirse.",
+      "parameters": {},
+      "payloadResponse": {
+        "finalMessage": "Su cita para {{medical_specialty}} el {{appointment_date}} a las {{appointment_time}} ha sido confirmada. ¡Gracias, {{capitalize(caller_name)}}!",
+        "summaryForSystem": "Cita: {{medical_specialty}}, Día: {{appointment_date}}, Hora: {{appointment_time}}, Paciente: {{patient_id_number}}, Edad: {{patient_age}}",
+        "totalCost": "Costo total: {{formatNumber(cost, 2)}}",
+        "nextAppointmentRecommendation": "{{sandbox_js: const d = new Date(collectedParameters.appointment_date); d.setMonth(d.getMonth() + 6); return 'Próxima revisión sugerida: ' + d.toISOString().split('T')[0]; }}",
+        "dynamicGreetingBasedOnTime": "{{sandbox_js: const h = new Date().getHours(); if (h < 12) return 'Buenos días'; else if (h < 18) return 'Buenas tardes'; else return 'Buenas noches';}} {{caller_name}}",
+        "apiHooks": {
+          "onEnterState": ["api_send_confirmation_message", "api_log_interaction_complete"]
+        }
+      },
+      "transitions": []
+    },
+    "98_age_ineligible": {
+      "id": "98_age_ineligible",
+      "description": "Informar al usuario que no es elegible por edad y finalizar.",
+      "payloadResponse": {
+        "messageToUser": "Lo sentimos {{default(caller_name, '')}}, no cumple con el requisito de edad ({{patient_age}}) para este servicio. Registrado a las {{current_time}}.",
+        "apiHooks": {
+          "onEnterState": ["api_log_ineligible_interaction", "api_send_age_ineligible_notification"]
+        }
+      },
+      "transitions": []
+    },
+    "99_transfer_to_human": {
+      "id": "99_transfer_to_human",
+      "description": "Transferir la conversación a un agente humano.",
+      "payloadResponse": {
+        "transferMessage": "Un momento, {{capitalize(caller_name)}}, por favor, lo transferiré con un agente. Hora de solicitud: {{current_datetime}}.",
+        "apiHooks": {
+          "onEnterState": ["api_initiate_transfer_to_human_agent", "api_log_transfer_request"]
+        }
+      },
+      "transitions": []
+    },
+    "2_get_patient_id_retry_invalid": {
+      "id": "2_get_patient_id_retry_invalid",
+      "description": "Informar que la cédula es inválida y solicitarla de nuevo.",
+      "parameters": {
+         "required": ["patient_id_number"],
+         "optional": ["id_document_type"]
+      },
+      "payloadResponse": {
+        "retryPrompt": "El número de identificación ingresado no es válido. Por favor, inténtelo de nuevo.",
+        "apiHooks": {
+          "onEnterState": ["api_log_id_retry_event"],
+          "beforeCollectingParameters": ["api_get_id_input_retry_instructions"],
+          "afterParametersCollected": ["api_validate_id_format", "api_log_id_provided_after_retry"]
+        }
+      },
+      "transitions": [
+        {
+          "nextState": "3_get_specialty",
+          "condition": { "allParametersMet": true }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent_after_max_retries" }
+        }
+      ],
+      "defaultNextState": "3_get_specialty"
+    },
+     "6_retry_appointment_time": {
+      "id": "6_retry_appointment_time",
+      "description": "Informar que la hora no está disponible y solicitar otra.",
+      "parameters": {
+        "required": ["appointment_time"]
+      },
+      "payloadResponse": {
+        "unavailablePrompt": "La hora seleccionada ya no está disponible. Por favor, elija otra hora.",
+        "apiHooks": {
+          "onEnterState": ["api_log_time_retry_event", "api_fetch_alternative_slots"],
+          "afterParametersCollected": ["api_book_appointment_slot"]
+        }
+      },
+      "transitions": [
+         {
+          "nextState": "7_confirmation_and_closing",
+          "condition": { "allParametersMet": true, "intent": "appointment_booked_success" }
+        },
+        {
+          "nextState": "6_retry_appointment_time",
+          "condition": { "intent": "appointment_slot_unavailable" }
+        },
+        {
+          "nextState": "99_transfer_to_human",
+          "condition": { "intent": "request_human_agent" }
+        }
+      ]
+    }
+  }
+}

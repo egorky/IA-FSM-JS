@@ -1,0 +1,31 @@
+{
+  "name": "nodejs-fsm-service",
+  "version": "1.0.0",
+  "description": "Máquina de estados finitos con Node.js, Express, Redis y Asterisk ARI",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "fsm",
+    "nodejs",
+    "express",
+    "redis",
+    "ari",
+    "asterisk"
+  ],
+  "author": "Jules AI Agent",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.17.1",
+    "ioredis": "^4.27.9",
+    "ari-client": "^2.2.0",
+    "dotenv": "^16.0.0",
+    "isolated-vm": "^4.6.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.12"
+  }
+}
