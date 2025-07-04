@@ -1,0 +1,17 @@
+{
+  "apiId": "fetch_doctor_availability",
+  "description": "Fetches available doctors or time slots based on specialty and optionally date.",
+  "url": "https://api.example.com/doctors/availability/{{medical_specialty}}",
+  "method": "GET",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}",
+    "X-Session-ID": "{{sessionId}}"
+  },
+  "query_params_template": {
+    "date": "{{appointment_date}}",
+    "location_preference": "{{location_id}}"
+  },
+  "timeout_ms": 5000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

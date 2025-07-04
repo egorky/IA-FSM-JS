@@ -1,86 +1,108 @@
 // scripts/simulateApiResponder.js
-require('dotenv').config({ path: require('path').join(__dirname, '../.env') }); // Load .env from root
+require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 const redisClient = require('../src/redisClient');
 const logger = require('../src/logger');
+const { getApiConfigById } = require('../src/apiConfigLoader'); // To get API details for mock data
 
-const API_REQUEST_QUEUE_KEY = 'fsm_api_request_queue'; // Must match fsm.js
-const API_RESPONSE_KEY_PREFIX = 'api_response:'; // Prefix for storing responses
-const POLLING_INTERVAL_MS = 3000; // Poll every 3 seconds
-const RESPONSE_TTL_SECONDS = 300; // Store response for 5 minutes
+// This script is now a one-shot tool to add a specific response to a Redis Stream.
+// It simulates an external worker that has processed an API call and is now reporting the result.
 
-async function processRequest(requestDetails) {
-  logger.info({ requestDetails }, 'API Responder: Processing request');
-  const { sessionId, correlationId, type, requestParams } = requestDetails;
-
-  let responseData = {};
-
-  // Simulate different API responses based on type
-  if (type === 'fetch_doctors_for_specialty') {
-    responseData = {
-      doctors: [
-        { id: 'doc123', name: 'Dr. Alice Smith', specialty: requestParams.specialty || 'Unknown', availableSlots: ['10:00 AM', '2:00 PM'] },
-        { id: 'doc456', name: 'Dr. Bob Johnson', specialty: requestParams.specialty || 'Unknown', availableSlots: ['11:00 AM', '3:00 PM'] },
-      ],
-      notes: `Found doctors for specialty: ${requestParams.specialty}. Location preference was: ${requestParams.locationPreference || 'any'}.`,
-    };
-  } else if (type === 'another_api_type') {
-    responseData = {
-      message: 'Response from another_api_type',
-      data: requestParams,
-    };
-  } else {
-    logger.warn({ type }, 'API Responder: Unknown API request type');
-    responseData = { error: 'Unknown API request type', requestType: type };
-  }
-
-  const responseKey = `${API_RESPONSE_KEY_PREFIX}${sessionId}:${correlationId}`;
-  try {
-    await redisClient.set(responseKey, JSON.stringify(responseData), 'EX', RESPONSE_TTL_SECONDS);
-    logger.info({ responseKey, responseData, ttl: RESPONSE_TTL_SECONDS }, 'API Responder: Response stored in Redis.');
-  } catch (err) {
-    logger.error({ err, responseKey }, 'API Responder: Error storing response in Redis.');
-  }
-}
-
-async function pollQueue() {
-  logger.debug('API Responder: Polling API request queue...');
-  try {
-    const requestJson = await redisClient.rpop(API_REQUEST_QUEUE_KEY);
-    if (requestJson) {
-      try {
-        const requestDetails = JSON.parse(requestJson);
-        await processRequest(requestDetails);
-      } catch (parseError) {
-        logger.error({ err: parseError, requestJson }, 'API Responder: Error parsing request from queue.');
-        // Potentially push back to queue or to a dead-letter queue if needed
-      }
-    }
-  } catch (err) {
-    logger.error({ err }, 'API Responder: Error polling Redis queue.');
-  }
-  setTimeout(pollQueue, POLLING_INTERVAL_MS); // Continue polling
-}
+// Usage: node scripts/simulateApiResponder.js <responseStreamKey> <sessionId> <correlationId> <apiId> [status] [httpCode] [customDataJsonString]
+// Example: node scripts/simulateApiResponder.js api_responses_stream:sess123:corr789 sess123 corr789 fetch_doctor_availability success 200 '{"custom_field":"custom_value"}'
+// Example (error): node scripts/simulateApiResponder.js api_responses_stream:sess123:corr789 sess123 corr789 fetch_doctor_availability error 503 '{"error_detail":"Service unavailable"}'
 
 async function main() {
-  logger.info('Starting Simulated API Responder...');
-  try {
-    await redisClient.connect(); // Ensure Redis client is connected
-    logger.info('API Responder: Connected to Redis.');
-    pollQueue();
-  } catch (err) {
-    logger.fatal({ err }, 'API Responder: Could not connect to Redis. Exiting.');
+  const args = process.argv.slice(2);
+  if (args.length < 4) {
+    logger.error('Usage: node simulateApiResponder.js <responseStreamKey> <sessionId> <correlationId> <apiId> [status] [httpCode] [customDataJsonString]');
     process.exit(1);
+  }
+
+  const [responseStreamKey, sessionId, correlationId, apiId, statusArg, httpCodeArg, customDataJsonString] = args;
+
+  const status = statusArg || 'success'; // Default to success
+  const httpCode = parseInt(httpCodeArg, 10) || (status === 'success' ? 200 : 500);
+  const isTimeout = status === 'error' && (httpCodeArg === 'TIMEOUT' || (httpCodeArg === '504' || httpCode === 504));
+
+
+  logger.info({ responseStreamKey, sessionId, correlationId, apiId, status, httpCode, customDataJsonString }, 'Simulating API response.');
+
+  await redisClient.connect(); // Ensure Redis is connected
+
+  let responsePayload = {
+    correlationId,
+    sessionId,
+    apiId,
+    status,
+    httpCode: httpCode || null, // Ensure null if not a valid number
+    data: null,
+    errorMessage: null,
+    isTimeout: isTimeout,
+    timestamp: new Date().toISOString(),
+  };
+
+  if (status === 'success') {
+    if (customDataJsonString) {
+        try {
+            responsePayload.data = JSON.parse(customDataJsonString);
+        } catch (e) {
+            logger.warn({customDataJsonString, err: e}, "Could not parse customDataJsonString, using default mock.");
+            responsePayload.data = { message: `Successfully processed ${apiId}`, defaultMock: true };
+        }
+    } else {
+        // Generate some default mock data based on apiId if no custom data provided
+        if (apiId === 'fetch_doctor_availability') {
+            responsePayload.data = {
+                doctors: [
+                    { id: 'docSim1', name: 'Dr. Simulated One', specialty: 'Cardiology', slots: ['1PM', '3PM'] },
+                    { id: 'docSim2', name: 'Dr. Virtual Two', specialty: 'Cardiology', slots: ['2PM', '4PM'] },
+                ],
+                source: 'simulator'
+            };
+        } else if (apiId === 'submit_appointment_booking') {
+            responsePayload.data = {
+                bookingId: `simBK-${uuidv4().slice(0,8)}`,
+                status: 'CONFIRMED_BY_SIMULATOR',
+                message: 'Appointment booking request received by simulator.'
+            };
+        } else {
+            responsePayload.data = { message: `Successfully processed ${apiId}`, defaultMock: true };
+        }
+    }
+  } else { // Error status
+    if (customDataJsonString) {
+        try {
+            const customErrorData = JSON.parse(customDataJsonString);
+            responsePayload.errorMessage = customErrorData.errorMessage || customErrorData.message || `Simulated error for ${apiId}`;
+            if(customErrorData.detail) responsePayload.data = customErrorData.detail; // Put extra error details in 'data' if any
+        } catch(e) {
+             logger.warn({customDataJsonString, err: e}, "Could not parse customDataJsonString for error, using default mock error.");
+            responsePayload.errorMessage = isTimeout ? `Simulated TIMEOUT for ${apiId}` : `Simulated error for ${apiId}`;
+        }
+    } else {
+        responsePayload.errorMessage = isTimeout ? `Simulated TIMEOUT for ${apiId}` : `Simulated error for ${apiId}`;
+    }
+    if (isTimeout) responsePayload.httpCode = null; // Typically timeouts don't have HTTP codes from target
+  }
+
+  // Convert payload to field-value array for XADD
+  // All values in the stream message MUST be strings.
+  const messageFields = [];
+  for (const key in responsePayload) {
+    messageFields.push(key, JSON.stringify(responsePayload[key])); // Stringify each value
+  }
+
+  try {
+    const messageId = await redisClient.xadd(responseStreamKey, '*', ...messageFields);
+    logger.info({ responseStreamKey, messageId, payloadSent: responsePayload }, 'Successfully added simulated API response to Redis Stream.');
+  } catch (err) {
+    logger.error({ err, responseStreamKey, payload: responsePayload }, 'Error adding message to Redis Stream.');
+  } finally {
+    await redisClient.quit();
   }
 }
 
-main();
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  logger.info('API Responder: Shutting down...');
-  if (redisClient.getClient()) { // Check if client exists
-    await redisClient.quit();
-    logger.info('API Responder: Redis connection closed.');
-  }
-  process.exit(0);
+main().catch(err => {
+  logger.fatal({ err }, 'Unhandled error in simulateApiResponder main.');
+  process.exit(1);
 });

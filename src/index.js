@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 const logger = require('./logger');
 const { startApiServer } = require('./apiServer');
 const { startSocketServer, stopSocketServer } = require('./socketServer');
@@ -14,8 +15,10 @@ const jsonValidator = require('./jsonValidator');
 const { validateAIResponse: customAIResponseValidator } = require('../config/customAIResponseValidator');
 
 const PROMPT_PATH = path.join(__dirname, '../config/aiPrompt.txt');
-const API_RESPONSE_KEY_PREFIX = 'api_response:'; // Must match simulateApiResponder.js
+// API_RESPONSE_KEY_PREFIX is no longer used for SCAN, replaced by stream logic.
 let aiPromptContent = '';
+const CONSUMER_GROUP_NAME = process.env.REDIS_STREAM_CONSUMER_GROUP || 'fsm_ai_group';
+const CONSUMER_NAME_PREFIX = process.env.REDIS_STREAM_CONSUMER_NAME_PREFIX || `fsm_consumer_${uuidv4()}`; // Unique consumer per instance
 
 function loadAIPrompt() {
   try {
@@ -32,86 +35,196 @@ function loadAIPrompt() {
   }
 }
 
-async function checkForAndCombineApiResponse(sessionId, currentText) {
-  let combinedText = currentText;
-  // Simplified check: Iterate through possible correlation IDs or a more direct lookup if FSM provides context
-  // For now, we'll use SCAN to find any response for the session.
-  // This is NOT efficient for production but okay for simulation.
-  // A better way: FSM indicates it's waiting for a specific correlationId.
-  let cursor = '0';
-  let apiResponseData = null;
-  let foundKey = null;
-
-  try {
-    do {
-      const scanResult = await redisClient.getClient().scan(cursor, 'MATCH', `${API_RESPONSE_KEY_PREFIX}${sessionId}:*`, 'COUNT', '10');
-      cursor = scanResult[0];
-      const keys = scanResult[1];
-
-      if (keys.length > 0) {
-        // Take the first one found for this simple simulation
-        foundKey = keys[0];
-        const responseJson = await redisClient.get(foundKey);
-        if (responseJson) {
-          apiResponseData = JSON.parse(responseJson);
-          logger.info({ sessionId, correlationKey: foundKey, apiResponseData }, 'Found and retrieved API response from Redis.');
-          await redisClient.del(foundKey); // Delete after processing
-          logger.info({ sessionId, correlationKey: foundKey }, 'Processed API response deleted from Redis.');
+async function ensureStreamGroupExists(streamKey, groupName) {
+    try {
+        // Attempt to create the group. If it exists, Redis returns an error that ioredis might throw.
+        // The 'MKSTREAM' option creates the stream if it doesn't exist.
+        await redisClient.xgroupCreate(streamKey, groupName, '$', true); // true for MKSTREAM
+    } catch (err) {
+        if (err && err.message.includes('BUSYGROUP')) {
+            logger.warn({ streamKey, groupName }, 'Redis Stream consumer group already exists.');
+        } else {
+            logger.error({ err, streamKey, groupName }, 'Failed to create or verify Redis Stream consumer group.');
+            throw err; // Rethrow if it's not a BUSYGROUP error
         }
-        break;
-      }
-    } while (cursor !== '0');
-
-    if (apiResponseData) {
-      combinedText = `${currentText}\n\n[API Response Context: ${JSON.stringify(apiResponseData)}]`;
-      logger.info({ sessionId }, 'Combined user text with API response context.');
     }
-  } catch (err) {
-    logger.error({ err, sessionId }, 'Error checking for or combining API response from Redis.');
-  }
-  return combinedText;
 }
 
 
-async function handleInputWithAI(sessionId, textInput, source) {
-  logger.info({ sessionId, textInputLength: textInput?.length, source }, 'Handling input with AI');
+async function checkForApiResponses(sessionId, sessionData, currentText) {
+  let combinedText = currentText;
+  const pendingResponses = sessionData.pendingApiResponses || {};
+  let newParametersFromApi = {};
 
-  // Log raw user input
-  redisClient.set(`input_text:${sessionId}:${Date.now()}`, JSON.stringify({ textInput, source }), 'EX', 3600)
+  for (const correlationId in pendingResponses) {
+    const pendingInfo = pendingResponses[correlationId];
+    if (!pendingInfo || !pendingInfo.responseStreamKey) continue;
+
+    logger.debug({ sessionId, correlationId, streamKey: pendingInfo.responseStreamKey }, 'Checking for API response in stream.');
+
+    // Ensure consumer group exists for this stream (idempotent)
+    await ensureStreamGroupExists(pendingInfo.responseStreamKey, CONSUMER_GROUP_NAME);
+
+    try {
+      // Try to read a new message for this consumer. '>' means only new messages.
+      // BLOCK for a short time, e.g., 100ms, not to halt the entire user interaction for too long if no message.
+      // The main "waiting" happens if the input request explicitly says waitForCorrelationId.
+      const blockTimeoutMs = parseInt(process.env.REDIS_STREAM_XREAD_BLOCK_MS_PER_ITEM, 10) || 100;
+      const streamResult = await redisClient.xreadgroup(
+        CONSUMER_GROUP_NAME,
+        `${CONSUMER_NAME_PREFIX}:${sessionId}`, // Unique consumer name per session
+        [pendingInfo.responseStreamKey, '>'], // '>' means new messages for this consumer group
+        blockTimeoutMs, // Short block, or 0 for non-blocking
+        1 // Read one message
+      );
+
+      if (streamResult && streamResult.length > 0) {
+        const streamName = streamResult[0][0]; // e.g., 'api_responses_stream:sessionId:correlationId'
+        const messages = streamResult[0][1];   // Array of messages [[messageId, [field, value, ...]]]
+
+        if (messages.length > 0) {
+          const messageId = messages[0][0];
+          const messageFields = messages[0][1]; // Array of [field, value, field, value,...]
+          let apiResponse = { correlationId: 'unknown' }; // Default
+          for (let i = 0; i < messageFields.length; i += 2) {
+            try {
+              // Assuming all values in stream are JSON strings
+              apiResponse[messageFields[i]] = JSON.parse(messageFields[i+1]);
+            } catch (e) {
+              apiResponse[messageFields[i]] = messageFields[i+1]; // Fallback if not JSON string
+            }
+          }
+
+          logger.info({ sessionId, correlationId: apiResponse.correlationId, stream: streamName, messageId, apiResponseStatus: apiResponse.status }, 'Retrieved API response from stream.');
+
+          const contextMarker = apiResponse.apiId || pendingInfo.apiId || 'UNKNOWN_API';
+          if (apiResponse.status === 'success') {
+            combinedText += `\n\n[API Response Context for '${contextMarker}' (ID: ${apiResponse.correlationId}): ${JSON.stringify(apiResponse.data)}]`;
+            // Optionally merge apiResponse.data into parameters if needed immediately by FSM or template
+            // For now, we primarily make it available to the AI via combinedText.
+            // And store it for potential direct use by FSM templates
+            newParametersFromApi[`api_${contextMarker}_data`] = apiResponse.data;
+
+          } else {
+            combinedText += `\n\n[API Error Context for '${contextMarker}' (ID: ${apiResponse.correlationId}): ${JSON.stringify({ httpCode: apiResponse.httpCode, message: apiResponse.errorMessage, isTimeout: apiResponse.isTimeout })}]`;
+            newParametersFromApi[`api_${contextMarker}_error`] = { httpCode: apiResponse.httpCode, message: apiResponse.errorMessage, isTimeout: apiResponse.isTimeout };
+          }
+
+          // Acknowledge the message
+          await redisClient.xack(streamName, CONSUMER_GROUP_NAME, messageId);
+          logger.debug({ sessionId, streamName, messageId }, 'Acknowledged API response message from stream.');
+
+          delete sessionData.pendingApiResponses[correlationId]; // Remove from pending
+        }
+      }
+    } catch (err) {
+      logger.error({ err, sessionId, correlationId, streamKey: pendingInfo.responseStreamKey }, 'Error reading from Redis Stream or processing message.');
+    }
+  }
+  return { combinedText, updatedSessionData: sessionData, newParametersFromApi };
+}
+
+
+async function handleInputWithAI(sessionId, clientInput, source) {
+  // clientInput could be simple text, or JSON like { userInput: "text", waitForCorrelationId: "cid" }
+  let userInputText = clientInput;
+  let waitForCorrelationId = null;
+
+  if (typeof clientInput === 'object' && clientInput !== null) {
+    userInputText = clientInput.userInput || '';
+    waitForCorrelationId = clientInput.waitForCorrelationId || null;
+  } else if (typeof clientInput !== 'string') {
+    userInputText = String(clientInput); // Ensure it's a string
+  }
+
+  logger.info({ sessionId, userInputLength: userInputText?.length, waitForCorrelationId, source }, 'Handling input with AI');
+
+  redisClient.set(`input_text:${sessionId}:${Date.now()}`, JSON.stringify({ userInputText, waitForCorrelationId, source }), 'EX', 3600)
     .catch(err => logger.error({ err, sessionId }, 'Failed to log input_text to Redis'));
 
-  // Check for and combine any pending API responses
-  const fullTextInputForAI = await checkForAndCombineApiResponse(sessionId, textInput);
+  let sessionData = await fsm.initializeOrRestoreSession(sessionId);
+  let currentParameters = { ...sessionData.parameters }; // Start with parameters from session
+
+  let fullTextInputForAI = userInputText;
+
+  // If explicitly waiting for a correlationId, block and read
+  if (waitForCorrelationId && sessionData.pendingApiResponses && sessionData.pendingApiResponses[waitForCorrelationId]) {
+    const pendingInfo = sessionData.pendingApiResponses[waitForCorrelationId];
+    logger.info({sessionId, correlationId: waitForCorrelationId, streamKey: pendingInfo.responseStreamKey}, `Explicitly waiting for API response on stream.`);
+    await ensureStreamGroupExists(pendingInfo.responseStreamKey, CONSUMER_GROUP_NAME);
+    try {
+      const blockTimeoutMs = parseInt(process.env.REDIS_STREAM_XREAD_BLOCK_WAIT_MS, 10) || 5000; // Configurable wait
+      const streamResult = await redisClient.xreadgroup(
+        CONSUMER_GROUP_NAME,
+        `${CONSUMER_NAME_PREFIX}:${sessionId}`,
+        [pendingInfo.responseStreamKey, '>'],
+        blockTimeoutMs, 1
+      );
+
+      if (streamResult && streamResult.length > 0 && streamResult[0][1].length > 0) {
+        const messageId = streamResult[0][1][0][0];
+        const messageFields = streamResult[0][1][0][1];
+        let apiResponse = { correlationId: 'unknown' };
+        for (let i = 0; i < messageFields.length; i += 2) {
+            try { apiResponse[messageFields[i]] = JSON.parse(messageFields[i+1]); }
+            catch (e) { apiResponse[messageFields[i]] = messageFields[i+1]; }
+        }
+        logger.info({ sessionId, correlationId: apiResponse.correlationId, apiResponseStatus: apiResponse.status }, 'Retrieved explicitly awaited API response.');
+        const contextMarker = apiResponse.apiId || pendingInfo.apiId || 'UNKNOWN_API';
+        if (apiResponse.status === 'success') {
+            fullTextInputForAI += `\n\n[API Response Context for '${contextMarker}' (ID: ${apiResponse.correlationId}): ${JSON.stringify(apiResponse.data)}]`;
+            currentParameters[`api_${contextMarker}_data`] = apiResponse.data;
+        } else {
+            fullTextInputForAI += `\n\n[API Error Context for '${contextMarker}' (ID: ${apiResponse.correlationId}): ${JSON.stringify({ httpCode: apiResponse.httpCode, message: apiResponse.errorMessage, isTimeout: apiResponse.isTimeout })}]`;
+            currentParameters[`api_${contextMarker}_error`] = { httpCode: apiResponse.httpCode, message: apiResponse.errorMessage, isTimeout: apiResponse.isTimeout };
+        }
+        await redisClient.xack(pendingInfo.responseStreamKey, CONSUMER_GROUP_NAME, messageId);
+        delete sessionData.pendingApiResponses[waitForCorrelationId];
+      } else {
+        logger.warn({sessionId, correlationId: waitForCorrelationId}, "Timed out waiting for explicit API response.");
+        // Could add specific error context for AI about the timeout
+        fullTextInputForAI += `\n\n[API Timeout Context: No response received for expected API call (ID: ${waitForCorrelationId}) within timeout.]`;
+        currentParameters[`api_wait_timeout_for_${pendingInfo.apiId || waitForCorrelationId}`] = true;
+        // FSM might need to handle this timeout (e.g. transition to an error state or retry)
+        // For now, we remove it from pending so we don't wait again unless FSM re-triggers
+        delete sessionData.pendingApiResponses[waitForCorrelationId];
+      }
+    } catch (err) {
+      logger.error({ err, sessionId, correlationId: waitForCorrelationId }, 'Error during explicit wait for API response from Redis Stream.');
+       delete sessionData.pendingApiResponses[waitForCorrelationId]; // Also remove if error
+    }
+  } else {
+    // If not explicitly waiting, check for any other pending responses non-blockingly / short-block
+    const { combinedText, updatedSessionData, newParametersFromApi } = await checkForApiResponses(sessionId, sessionData, fullTextInputForAI);
+    fullTextInputForAI = combinedText;
+    sessionData = updatedSessionData;
+    currentParameters = {...currentParameters, ...newParametersFromApi};
+  }
+
+  sessionData.parameters = currentParameters; // Persist any new params from API data
+  // Save session early here as pendingApiResponses might have changed
+  fsm.saveSessionAsync(`${fsm.FSM_SESSION_PREFIX}${sessionId}`, sessionData, parseInt(process.env.REDIS_SESSION_TTL, 10));
+
 
   if (!aiPromptContent) {
     logger.error({ sessionId, source }, 'AI prompt is not loaded. Cannot process AI response.');
-    try {
-        const parsedInput = JSON.parse(fullTextInputForAI); // Try parsing combined input
-        if (parsedInput.intent && parsedInput.parameters) {
-            logger.warn({sessionId, source }, "AI prompt missing, but input was valid JSON. Proceeding with input as FSM params.");
-            redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(parsedInput), 'EX', 3600).catch(err => logger.error({ err }, '(Fallback) FSM Input log failed'));
-            return fsm.processInput(sessionId, parsedInput.intent, parsedInput.parameters);
-        }
-    } catch (e) { /* Not JSON */ }
-    logger.warn({sessionId, source}, "AI prompt missing and input not usable. Using default 'general_inquiry'.");
-    const fallbackFsmInput = { intent: 'general_inquiry', parameters: { raw_text: fullTextInputForAI } };
-    redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(Default Fallback) FSM Input log failed'));
-    return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+    // ... (fallback logic as before, using fullTextInputForAI)
+    const fallbackFsmInput = { intent: 'ai_prompt_missing_error', parameters: { raw_text: fullTextInputForAI } };
+    redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(Fallback) FSM Input log failed'));
+    return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters); // Pass currentParameters
   }
 
   let aiJsonResponse;
   try {
-    // Log the text that will actually be sent to AI (could be combined with API response)
     redisClient.set(`ai_actual_input:${sessionId}:${Date.now()}`, JSON.stringify({ textForAI: fullTextInputForAI }), 'EX', 3600)
       .catch(err => logger.error({ err, sessionId }, 'Failed to log actual_input_for_ai to Redis'));
 
     aiJsonResponse = await aiService.getAIResponse(fullTextInputForAI, aiPromptContent);
-    // aiService logs its direct input/output
   } catch (aiError) {
     logger.error({ err: aiError, sessionId, source }, 'AI service failed to get response.');
     const fallbackFsmInput = { intent: 'ai_processing_error', parameters: { error: aiError.message, original_text: fullTextInputForAI } };
-    redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(AI Error Fallback) FSM Input log failed'));
-    return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+     redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(AI Error Fallback) FSM Input log failed'));
+    return fsm.processInput(sessionId, fallbackFsmInput.intent, {...currentParameters, ...fallbackFsmInput.parameters});
   }
 
   const schemaValidationResult = jsonValidator.validateJson(aiJsonResponse);
@@ -119,7 +232,7 @@ async function handleInputWithAI(sessionId, textInput, source) {
     logger.warn({ sessionId, errors: schemaValidationResult.errors, aiResponse: aiJsonResponse, source }, 'AI response failed JSON schema validation.');
     const fallbackFsmInput = { intent: 'ai_schema_validation_error', parameters: { errors: schemaValidationResult.errors, original_response: aiJsonResponse } };
     redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(Schema Error Fallback) FSM Input log failed'));
-    return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+    return fsm.processInput(sessionId, fallbackFsmInput.intent, {...currentParameters, ...fallbackFsmInput.parameters});
   }
 
   let finalAiResponse = aiJsonResponse;
@@ -129,7 +242,7 @@ async function handleInputWithAI(sessionId, textInput, source) {
       logger.warn({ sessionId, message: customValidationResult.message, aiResponse: aiJsonResponse, source }, 'AI response failed custom validation.');
       const fallbackFsmInput = { intent: 'ai_custom_validation_error', parameters: { error_message: customValidationResult.message, original_response: aiJsonResponse } };
       redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(Custom Val Error Fallback) FSM Input log failed'));
-      return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
+      return fsm.processInput(sessionId, fallbackFsmInput.intent, {...currentParameters, ...fallbackFsmInput.parameters});
     }
     if (customValidationResult.validatedResponse) {
       finalAiResponse = customValidationResult.validatedResponse;
@@ -137,12 +250,17 @@ async function handleInputWithAI(sessionId, textInput, source) {
     }
   }
 
-  logger.info({ sessionId, intent: finalAiResponse.intent, parameters: finalAiResponse.parameters, source }, 'AI response validated, proceeding to FSM.');
+  logger.info({ sessionId, intent: finalAiResponse.intent, /* parameters: finalAiResponse.parameters,*/ source }, 'AI response validated, proceeding to FSM.');
 
-  redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(finalAiResponse), 'EX', 3600)
+  // Merge AI parameters with existing currentParameters (which includes API responses)
+  // AI parameters should generally take precedence for things it directly extracted from user's latest utterance.
+  const fsmInputParameters = {...currentParameters, ...finalAiResponse.parameters};
+
+  redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify({intent: finalAiResponse.intent, parameters: fsmInputParameters}), 'EX', 3600)
     .catch(err => logger.error({ err, sessionId }, 'Failed to log fsm_input to Redis'));
 
-  const fsmResult = await fsm.processInput(sessionId, finalAiResponse.intent, finalAiResponse.parameters);
+  const fsmResult = await fsm.processInput(sessionId, finalAiResponse.intent, fsmInputParameters);
+  // fsm.processInput will save the updated sessionData (which includes its own currentParameters and pendingApiResponses)
 
   redisClient.set(`fsm_output:${sessionId}:${Date.now()}`, JSON.stringify(fsmResult), 'EX', 3600)
     .catch(err => logger.error({ err, sessionId }, 'Failed to log fsm_output to Redis'));
@@ -152,23 +270,18 @@ async function handleInputWithAI(sessionId, textInput, source) {
 
 async function main() {
   logger.info(`Valor de process.env.ENABLE_API: ${process.env.ENABLE_API}`);
-  logger.info(`Valor de process.env.ENABLE_ARI: ${process.env.ENABLE_ARI}`);
-  logger.info(`Valor de process.env.ENABLE_SOCKET_SERVER: ${process.env.ENABLE_SOCKET_SERVER}`);
-  logger.info(`Valor de process.env.FSM_SOCKET_PATH: ${process.env.FSM_SOCKET_PATH}`);
-  logger.info(`Valor de process.env.AI_PROVIDER: ${process.env.AI_PROVIDER}`);
-
-  let ariConnected = false;
-  let socketServerStarted = false;
-
+  // ... (rest of main remains similar, ensuring redisClient.connect() is awaited)
   try {
     logger.info('Inicializando aplicación FSM...');
     loadStateConfig();
     jsonValidator.loadSchema();
     loadAIPrompt();
 
-    await redisClient.connect();
-    logger.info('Conexión con Redis establecida.');
+    await redisClient.connect(); // Ensure main client is connected
+    await redisClient.getSubscriberClient(); // Ensure subscriber client is connected
+    logger.info('Conexión con Redis (main y subscriber) establecida.');
 
+    // ... (rest of server startups)
     const enableApi = process.env.ENABLE_API !== 'false';
     if (enableApi) {
       startApiServer(handleInputWithAI);
@@ -180,7 +293,7 @@ async function main() {
     if (enableAri) {
       logger.info('Intentando conectar a Asterisk ARI...');
       await connectAri(handleInputWithAI);
-      ariConnected = true;
+      // ariConnected = true; // This variable is not used elsewhere in main after this block
       logger.info('Módulo ARI iniciado (o intentando conectar).');
     } else {
       logger.info('Módulo ARI está deshabilitado por configuración (ENABLE_ARI=false).');
@@ -191,7 +304,7 @@ async function main() {
     if (enableSocketServer) {
       if (fsmSocketPath) {
         startSocketServer(fsmSocketPath, handleInputWithAI);
-        socketServerStarted = true;
+        // socketServerStarted = true; // This variable is not used elsewhere in main after this block
       } else {
         logger.warn('ADVERTENCIA: ENABLE_SOCKET_SERVER está en true, pero FSM_SOCKET_PATH no está definido. El servidor de sockets no se iniciará.');
       }
@@ -199,7 +312,7 @@ async function main() {
       logger.info('Módulo Socket Server está deshabilitado por configuración (ENABLE_SOCKET_SERVER=false).');
     }
 
-    if (enableApi || enableAri || socketServerStarted) {
+    if (enableApi || process.env.ENABLE_ARI !== 'false' || (enableSocketServer && fsmSocketPath) ) {
       logger.info('Aplicación FSM iniciada y lista (al menos un módulo de interfaz está activo).');
     } else {
       logger.warn('ADVERTENCIA: Todos los módulos de interfaz (API, ARI, Socket) están deshabilitados. La aplicación no podrá recibir solicitudes.');
@@ -207,20 +320,17 @@ async function main() {
 
   } catch (error) {
     logger.fatal({ err: error }, 'Error fatal durante la inicialización de la aplicación');
-    if (ariConnected && process.env.ENABLE_ARI !== 'false') {
-      await closeAri().catch(err => logger.error({ err }, 'Error al cerrar ARI durante el apagado por error'));
-    }
-    if (socketServerStarted && process.env.ENABLE_SOCKET_SERVER !== 'false') {
-      await stopSocketServer(process.env.FSM_SOCKET_PATH).catch(err => logger.error({ err }, 'Error al cerrar Socket Server durante el apagado por error'));
-    }
-    await redisClient.quit().catch(err => logger.error({ err }, 'Error al cerrar Redis durante el apagado por error'));
-    process.exit(1);
+    // ariConnected and socketServerStarted are not reliable here if error happened before they were set.
+    // Shutdown logic will attempt to close what it can based on env vars.
+    await shutdown('fatal_initialization_error'); // Attempt graceful shutdown
+    process.exit(1); // Still exit, but after attempting cleanup
   }
 }
 
 async function shutdown(signal) {
-  logger.info(`\nRecibida señal ${signal}. Cerrando la aplicación FSM...`);
+  logger.info({signal}, `\nRecibida señal ${signal}. Cerrando la aplicación FSM...`);
 
+  // No need to check ariConnected/socketServerStarted, just rely on env flags and let modules handle null clients
   if (process.env.ENABLE_ARI !== 'false') {
       await closeAri().catch(err => logger.error({ err }, 'Error al cerrar ARI'));
   }
@@ -230,18 +340,25 @@ async function shutdown(signal) {
   await redisClient.quit().catch(err => logger.error({ err }, 'Error al cerrar Redis'));
 
   logger.info('Aplicación FSM cerrada.');
-  process.exit(0);
+  if (signal !== 'fatal_initialization_error') { // Avoid double exit if called from fatal error handler
+    process.exit(0);
+  }
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('uncaughtException', (error) => {
-  logger.fatal({ err: error }, 'Excepción no capturada');
-  process.exit(1);
+process.on('uncaughtException', (error, origin) => {
+  logger.fatal({ err: error, origin }, 'Excepción no capturada');
+  // Attempt graceful shutdown before exiting, but this might be risky if state is very corrupt
+  shutdown('uncaughtException').finally(() => {
+    process.exit(1);
+  });
 });
 process.on('unhandledRejection', (reason, promise) => {
   logger.fatal({ reason, promise }, 'Rechazo de promesa no manejado');
-  process.exit(1);
+  shutdown('unhandledRejection').finally(() => {
+    process.exit(1);
+  });
 });
 
 main();

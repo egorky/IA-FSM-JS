@@ -1,0 +1,28 @@
+{
+  "apiId": "submit_appointment_booking",
+  "description": "Submits a request to book an appointment.",
+  "url": "https://api.example.com/appointments/book",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}",
+    "X-Correlation-ID": "{{correlationId}}"
+  },
+  "body_template": {
+    "sessionId": "{{sessionId}}",
+    "patient": {
+      "id": "{{patient_id_number}}",
+      "name": "{{caller_name}}"
+    },
+    "appointmentDetails": {
+      "specialty": "{{medical_specialty}}",
+      "doctorId": "{{selected_doctor_id}}",
+      "date": "{{appointment_date}}",
+      "time": "{{appointment_time}}",
+      "location": "{{location_id}}"
+    },
+    "notes": "Booked via FSM-AI system."
+  },
+  "timeout_ms": 10000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

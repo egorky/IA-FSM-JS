@@ -1,16 +1,15 @@
 const { getStateById, getInitialStateId } = require('./configLoader');
 const redisClient = require('./redisClient');
 const { processTemplate } = require('./templateProcessor');
-const logger = require('./logger'); // Use pino logger
+const logger = require('./logger');
+const { v4: uuidv4 } = require('uuid');
+const apiCallerService = require('./apiCallerService');
+const { getApiConfigById } = require('./apiConfigLoader');
 
 const FSM_SESSION_PREFIX = 'fsm_session:';
-const API_REQUEST_QUEUE_KEY = 'fsm_api_request_queue'; // Redis key for simulated API request queue
 
 /**
  * Asynchronously saves session data to Redis. Does not block.
- * @param {string} sessionKey Key for Redis.
- * @param {object} sessionData Data to save.
- * @param {number} sessionTTL TTL in seconds.
  */
 function saveSessionAsync(sessionKey, sessionData, sessionTTL) {
   const jsonData = JSON.stringify(sessionData);
@@ -27,37 +26,26 @@ function saveSessionAsync(sessionKey, sessionData, sessionTTL) {
   });
 }
 
-/**
- * Asynchronously "sends" an API request to the simulated queue in Redis.
- * @param {object} apiRequestDetails The details of the API request.
- */
-function sendApiRequestAsync(apiRequestDetails) {
-  const jsonData = JSON.stringify(apiRequestDetails);
-  redisClient.lpush(API_REQUEST_QUEUE_KEY, jsonData)
-    .then(length => {
-      logger.info({ apiRequest: apiRequestDetails, queueLength: length }, 'Simulated API request sent to Redis queue.');
-    })
-    .catch(err => {
-      logger.error({ err, apiRequest: apiRequestDetails }, 'Failed to send simulated API request to Redis queue.');
-    });
-}
-
 async function initializeOrRestoreSession(sessionId) {
   const sessionKey = `${FSM_SESSION_PREFIX}${sessionId}`;
   let sessionDataString = await redisClient.get(sessionKey);
 
   if (sessionDataString) {
     logger.debug({ sessionId }, 'FSM session restored from Redis.');
-    return JSON.parse(sessionDataString);
+    const session = JSON.parse(sessionDataString);
+    if (!session.pendingApiResponses) {
+      session.pendingApiResponses = {};
+    }
+    return session;
   } else {
     const initialStateId = getInitialStateId();
     const initialSession = {
       currentStateId: initialStateId,
       parameters: {},
       history: [initialStateId],
+      pendingApiResponses: {},
     };
     const sessionTTL = parseInt(process.env.REDIS_SESSION_TTL, 10);
-    // Save initial session asynchronously (fire and forget)
     saveSessionAsync(sessionKey, initialSession, sessionTTL);
     logger.info({ sessionId, initialStateId }, 'FSM new session initialized.');
     return initialSession;
@@ -76,17 +64,22 @@ async function processInput(sessionId, intent, inputParameters = {}) {
   }
 
   let currentParameters = { ...sessionData.parameters, ...inputParameters };
+  sessionData.parameters = currentParameters;
+  if (!sessionData.pendingApiResponses) {
+    sessionData.pendingApiResponses = {};
+  }
 
   const currentStateConfig = getStateById(currentStateId);
   if (!currentStateConfig) {
     logger.error({ currentStateId, sessionId }, 'FSM Error: Configuración no encontrada para el estado actual.');
     throw new Error(`Configuración no encontrada para el estado: ${currentStateId}`);
   }
-  logger.debug({ sessionId, currentStateId, currentParameters, effectiveIntent }, 'FSM processing input');
+  logger.debug({ sessionId, currentStateId, /*currentParameters: 'OMITTED'*/ effectiveIntent }, 'FSM processing input');
 
   let nextStateId = null;
   let matchedTransition = false;
 
+  // ... (transition logic - unchanged) ...
   if (effectiveIntent && currentStateConfig.transitions && currentStateConfig.transitions.length > 0) {
     for (const transition of currentStateConfig.transitions) {
       if (transition.condition && transition.condition.intent === effectiveIntent) {
@@ -97,7 +90,6 @@ async function processInput(sessionId, intent, inputParameters = {}) {
       }
     }
   }
-
   if (!matchedTransition && currentStateConfig.transitions && currentStateConfig.transitions.length > 0) {
     for (const transition of currentStateConfig.transitions) {
       if (transition.condition && !transition.condition.intent) {
@@ -119,7 +111,6 @@ async function processInput(sessionId, intent, inputParameters = {}) {
       }
     }
   }
-
   if (!matchedTransition && currentStateConfig.defaultNextState) {
     const requiredParams = currentStateConfig.parameters?.required || [];
     const allRequiredMet = requiredParams.every(param => currentParameters.hasOwnProperty(param) && currentParameters[param] !== null && currentParameters[param] !== '');
@@ -128,28 +119,79 @@ async function processInput(sessionId, intent, inputParameters = {}) {
       logger.debug({ sessionId, transitionTo: nextStateId, reason: 'Default next state, all params met' }, 'FSM transition by defaultNextState');
     }
   }
-
   if (!nextStateId) {
     nextStateId = currentStateId;
     logger.debug({ sessionId, state: currentStateId }, 'FSM staying in current state');
   }
+  // --- End of transition logic ---
 
   if (currentStateId !== nextStateId) {
     logger.info({ sessionId, fromState: currentStateId, toState: nextStateId }, `FSM transitioning`);
   }
   sessionData.currentStateId = nextStateId;
-  sessionData.parameters = currentParameters;
-  if (nextStateId !== currentStateId && !sessionData.history.includes(nextStateId)) {
+  if (nextStateId !== currentStateId && (!sessionData.history.length || sessionData.history[sessionData.history.length -1] !== nextStateId) ) {
     sessionData.history.push(nextStateId);
   }
-
-  const sessionTTL = parseInt(process.env.REDIS_SESSION_TTL, 10);
-  saveSessionAsync(sessionKey, sessionData, sessionTTL);
 
   const nextStateConfig = getStateById(nextStateId);
   if (!nextStateConfig) {
     logger.error({ nextStateId, sessionId }, 'FSM Error: Configuración no encontrada para el siguiente estado.');
     throw new Error(`Configuración no encontrada para el siguiente estado: ${nextStateId}`);
+  }
+
+  let renderedPayloadResponse = {};
+  if (nextStateConfig.payloadResponse) {
+    try {
+      renderedPayloadResponse = processTemplate(
+        JSON.parse(JSON.stringify(nextStateConfig.payloadResponse)),
+        currentParameters
+      );
+
+      const asyncCallsDefinition = nextStateConfig.payloadResponse.asyncApiCallsToTrigger; // Use original config path
+      if (asyncCallsDefinition && Array.isArray(asyncCallsDefinition)) {
+        for (const callDefinition of asyncCallsDefinition) {
+          const correlationId = callDefinition.assignCorrelationIdTo
+            ? currentParameters[callDefinition.assignCorrelationIdTo] || uuidv4()
+            : uuidv4();
+
+          if (callDefinition.assignCorrelationIdTo) {
+            currentParameters[callDefinition.assignCorrelationIdTo] = correlationId;
+            sessionData.parameters[callDefinition.assignCorrelationIdTo] = correlationId;
+          }
+
+          let processedApiParams = {};
+          if (callDefinition.params) {
+            processedApiParams = processTemplate(
+              JSON.parse(JSON.stringify(callDefinition.params)),
+              currentParameters
+            );
+          }
+
+          const apiConfig = getApiConfigById(callDefinition.apiId);
+          if (!apiConfig || !apiConfig.response_stream_key_template) {
+            logger.error({ apiId: callDefinition.apiId, sessionId }, `FSM: Missing apiConfig or response_stream_key_template for async API call. Skipping.`);
+            continue;
+          }
+
+          const templateContextForStreamKey = { ...currentParameters, correlationId, sessionId };
+          const responseStreamKey = processTemplate(apiConfig.response_stream_key_template, templateContextForStreamKey);
+
+          sessionData.pendingApiResponses[correlationId] = {
+            apiId: callDefinition.apiId,
+            responseStreamKey: responseStreamKey, // Store the actual stream key
+            requestedAt: new Date().toISOString(),
+          };
+          logger.info({sessionId, correlationId, apiId: callDefinition.apiId, responseStreamKey}, "FSM: Marked API call as pending. Triggering call via apiCallerService.");
+
+          // apiCallerService.makeRequest is fire-and-forget for the FSM.
+          // It handles its own logging of dispatch.
+          apiCallerService.makeRequest(callDefinition.apiId, sessionId, correlationId, processedApiParams);
+        }
+      }
+    } catch (templateError) {
+      logger.error({ err: templateError, sessionId, state: nextStateId }, `FSM Error: Error procesando plantilla o asyncApiCallsToTrigger.`);
+      renderedPayloadResponse = JSON.parse(JSON.stringify(nextStateConfig.payloadResponse));
+    }
   }
 
   const requiredForNext = nextStateConfig.parameters?.required || [];
@@ -159,52 +201,17 @@ async function processInput(sessionId, intent, inputParameters = {}) {
       optional: optionalForNext.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === '')
   };
 
-  let renderedPayloadResponse = {};
-  if (nextStateConfig.payloadResponse) {
-    try {
-      // Process the entire payloadResponse first, as externalApiCall might depend on its rendered values.
-      renderedPayloadResponse = processTemplate(nextStateConfig.payloadResponse, currentParameters);
+  const sessionTTL = parseInt(process.env.REDIS_SESSION_TTL, 10);
+  saveSessionAsync(sessionKey, sessionData, sessionTTL);
 
-      // Check for and process externalApiCall if it exists in the *original* config,
-      // then render its specific parts.
-      if (nextStateConfig.payloadResponse.externalApiCall) {
-        let apiCallDetails = JSON.parse(JSON.stringify(nextStateConfig.payloadResponse.externalApiCall)); // Deep copy
-
-        // Render requestParams
-        if (apiCallDetails.requestParams) {
-          apiCallDetails.requestParams = processTemplate(apiCallDetails.requestParams, currentParameters);
-        }
-        // Render correlationId
-        if (apiCallDetails.correlationId) {
-          apiCallDetails.correlationId = processTemplate(apiCallDetails.correlationId, currentParameters);
-        }
-
-        const apiRequest = {
-          sessionId: sessionId,
-          correlationId: apiCallDetails.correlationId || `${sessionId}-${Date.now()}`, // Fallback correlationId
-          type: apiCallDetails.type,
-          requestParams: apiCallDetails.requestParams || {},
-          timestamp: new Date().toISOString()
-        };
-        sendApiRequestAsync(apiRequest);
-        // The renderedPayloadResponse should still contain the original externalApiCall structure if needed by client
-        // Or we can decide to strip it, or add the rendered version. For now, keeping original in renderedPayload.
-      }
-    } catch (templateError) {
-      logger.error({ err: templateError, sessionId, state: nextStateId }, `FSM Error: Error procesando plantilla o externalApiCall para estado.`);
-      // Fallback to unrendered payload if main processing fails
-      renderedPayloadResponse = nextStateConfig.payloadResponse;
-    }
-  }
-
-  logger.debug({ sessionId, nextStateId, paramsToCollect: parametersToCollect.required.length, payloadKeys: Object.keys(renderedPayloadResponse).length }, 'FSM processing complete');
+  logger.debug({ sessionId, nextStateId, paramsToCollect: parametersToCollect.required.length, /*payloadKeys: Object.keys(renderedPayloadResponse).length*/ }, 'FSM processing complete');
 
   return {
     nextStateId: nextStateId,
     currentStateConfig: currentStateConfig,
     nextStateConfig: nextStateConfig,
     parametersToCollect: parametersToCollect,
-    payloadResponse: renderedPayloadResponse, // This will include the (unrendered) externalApiCall if it was in original
+    payloadResponse: renderedPayloadResponse,
     sessionData: sessionData,
   };
 }
@@ -212,4 +219,7 @@ async function processInput(sessionId, intent, inputParameters = {}) {
 module.exports = {
   initializeOrRestoreSession,
   processInput,
+  // Expose for handleInputWithAI to save session after stream processing
+  saveSessionAsync,
+  FSM_SESSION_PREFIX
 };
