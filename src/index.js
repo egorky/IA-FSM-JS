@@ -1,21 +1,20 @@
-require('dotenv').config(); // Cargar variables de entorno desde .env al inicio
-
-require('dotenv').config(); // Cargar variables de entorno desde .env al inicio
+require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
-const logger = require('./logger'); // Usar pino logger
+const logger = require('./logger');
 const { startApiServer } = require('./apiServer');
 const { startSocketServer, stopSocketServer } = require('./socketServer');
 const redisClient = require('./redisClient');
 const { connectAri, closeAri } = require('./ariClient');
 const fsm = require('./fsm');
 const { loadStateConfig } = require('./configLoader');
-const aiService = require('./aiService'); // Import AI Service
-const jsonValidator = require('./jsonValidator'); // Import JSON Validator
-const { validateAIResponse: customAIResponseValidator } = require('../config/customAIResponseValidator'); // Import custom validator
+const aiService = require('./aiService');
+const jsonValidator = require('./jsonValidator');
+const { validateAIResponse: customAIResponseValidator } = require('../config/customAIResponseValidator');
 
 const PROMPT_PATH = path.join(__dirname, '../config/aiPrompt.txt');
+const API_RESPONSE_KEY_PREFIX = 'api_response:'; // Must match simulateApiResponder.js
 let aiPromptContent = '';
 
 function loadAIPrompt() {
@@ -25,7 +24,7 @@ function loadAIPrompt() {
       logger.info('AI prompt content loaded successfully.');
     } else {
       logger.error(`AI prompt file not found at ${PROMPT_PATH}. AI processing will likely fail.`);
-      aiPromptContent = ''; // Ensure it's empty if not found
+      aiPromptContent = '';
     }
   } catch (error) {
     logger.error({ err: error, promptPath: PROMPT_PATH }, 'Error loading AI prompt file.');
@@ -33,67 +32,103 @@ function loadAIPrompt() {
   }
 }
 
+async function checkForAndCombineApiResponse(sessionId, currentText) {
+  let combinedText = currentText;
+  // Simplified check: Iterate through possible correlation IDs or a more direct lookup if FSM provides context
+  // For now, we'll use SCAN to find any response for the session.
+  // This is NOT efficient for production but okay for simulation.
+  // A better way: FSM indicates it's waiting for a specific correlationId.
+  let cursor = '0';
+  let apiResponseData = null;
+  let foundKey = null;
+
+  try {
+    do {
+      const scanResult = await redisClient.getClient().scan(cursor, 'MATCH', `${API_RESPONSE_KEY_PREFIX}${sessionId}:*`, 'COUNT', '10');
+      cursor = scanResult[0];
+      const keys = scanResult[1];
+
+      if (keys.length > 0) {
+        // Take the first one found for this simple simulation
+        foundKey = keys[0];
+        const responseJson = await redisClient.get(foundKey);
+        if (responseJson) {
+          apiResponseData = JSON.parse(responseJson);
+          logger.info({ sessionId, correlationKey: foundKey, apiResponseData }, 'Found and retrieved API response from Redis.');
+          await redisClient.del(foundKey); // Delete after processing
+          logger.info({ sessionId, correlationKey: foundKey }, 'Processed API response deleted from Redis.');
+        }
+        break;
+      }
+    } while (cursor !== '0');
+
+    if (apiResponseData) {
+      combinedText = `${currentText}\n\n[API Response Context: ${JSON.stringify(apiResponseData)}]`;
+      logger.info({ sessionId }, 'Combined user text with API response context.');
+    }
+  } catch (err) {
+    logger.error({ err, sessionId }, 'Error checking for or combining API response from Redis.');
+  }
+  return combinedText;
+}
+
+
 async function handleInputWithAI(sessionId, textInput, source) {
   logger.info({ sessionId, textInputLength: textInput?.length, source }, 'Handling input with AI');
-  await redisClient.set(`input_text:${sessionId}:${Date.now()}`, JSON.stringify({ textInput, source }), 'EX', 3600)
-    .catch(err => logger.error({ err }, 'Failed to log input_text to Redis'));
+
+  // Log raw user input
+  redisClient.set(`input_text:${sessionId}:${Date.now()}`, JSON.stringify({ textInput, source }), 'EX', 3600)
+    .catch(err => logger.error({ err, sessionId }, 'Failed to log input_text to Redis'));
+
+  // Check for and combine any pending API responses
+  const fullTextInputForAI = await checkForAndCombineApiResponse(sessionId, textInput);
 
   if (!aiPromptContent) {
     logger.error({ sessionId, source }, 'AI prompt is not loaded. Cannot process AI response.');
-    // Fallback: Try to pass input directly to FSM if it looks like JSON, or use a default
     try {
-        const parsedInput = JSON.parse(textInput);
+        const parsedInput = JSON.parse(fullTextInputForAI); // Try parsing combined input
         if (parsedInput.intent && parsedInput.parameters) {
             logger.warn({sessionId, source }, "AI prompt missing, but input was valid JSON. Proceeding with input as FSM params.");
-            await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(parsedInput), 'EX', 3600)
-              .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (fallback)'));
+            redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(parsedInput), 'EX', 3600).catch(err => logger.error({ err }, '(Fallback) FSM Input log failed'));
             return fsm.processInput(sessionId, parsedInput.intent, parsedInput.parameters);
         }
-    } catch (e) {
-        // Not JSON, or not the right structure
-    }
-    // Default fallback: use a generic intent or error state
+    } catch (e) { /* Not JSON */ }
     logger.warn({sessionId, source}, "AI prompt missing and input not usable. Using default 'general_inquiry'.");
-    const fallbackFsmInput = { intent: 'general_inquiry', parameters: { raw_text: textInput } };
-    await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
-        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (default fallback)'));
+    const fallbackFsmInput = { intent: 'general_inquiry', parameters: { raw_text: fullTextInputForAI } };
+    redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(Default Fallback) FSM Input log failed'));
     return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
   }
 
   let aiJsonResponse;
   try {
-    aiJsonResponse = await aiService.getAIResponse(textInput, aiPromptContent);
-    // aiService already logs its input/output to Redis
+    // Log the text that will actually be sent to AI (could be combined with API response)
+    redisClient.set(`ai_actual_input:${sessionId}:${Date.now()}`, JSON.stringify({ textForAI: fullTextInputForAI }), 'EX', 3600)
+      .catch(err => logger.error({ err, sessionId }, 'Failed to log actual_input_for_ai to Redis'));
+
+    aiJsonResponse = await aiService.getAIResponse(fullTextInputForAI, aiPromptContent);
+    // aiService logs its direct input/output
   } catch (aiError) {
-    logger.error({ err: aiError, sessionId, textInput, source }, 'AI service failed to get response.');
-    // Fallback to a generic intent if AI fails
-    const fallbackFsmInput = { intent: 'ai_processing_error', parameters: { error: aiError.message, original_text: textInput } };
-    await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
-        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (AI error fallback)'));
+    logger.error({ err: aiError, sessionId, source }, 'AI service failed to get response.');
+    const fallbackFsmInput = { intent: 'ai_processing_error', parameters: { error: aiError.message, original_text: fullTextInputForAI } };
+    redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(AI Error Fallback) FSM Input log failed'));
     return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
   }
 
-  // Schema Validation
   const schemaValidationResult = jsonValidator.validateJson(aiJsonResponse);
   if (!schemaValidationResult.isValid) {
     logger.warn({ sessionId, errors: schemaValidationResult.errors, aiResponse: aiJsonResponse, source }, 'AI response failed JSON schema validation.');
-    // Fallback or error handling for schema validation failure
     const fallbackFsmInput = { intent: 'ai_schema_validation_error', parameters: { errors: schemaValidationResult.errors, original_response: aiJsonResponse } };
-    await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
-        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (schema error fallback)'));
+    redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(Schema Error Fallback) FSM Input log failed'));
     return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
   }
 
-  // Custom Validation
   let finalAiResponse = aiJsonResponse;
   if (typeof customAIResponseValidator === 'function') {
     const customValidationResult = customAIResponseValidator(aiJsonResponse);
     if (!customValidationResult.isValid) {
       logger.warn({ sessionId, message: customValidationResult.message, aiResponse: aiJsonResponse, source }, 'AI response failed custom validation.');
-      // Fallback or error handling for custom validation failure
       const fallbackFsmInput = { intent: 'ai_custom_validation_error', parameters: { error_message: customValidationResult.message, original_response: aiJsonResponse } };
-      await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600)
-        .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis (custom validation error fallback)'));
+      redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(fallbackFsmInput), 'EX', 3600).catch(err => logger.error({ err }, '(Custom Val Error Fallback) FSM Input log failed'));
       return fsm.processInput(sessionId, fallbackFsmInput.intent, fallbackFsmInput.parameters);
     }
     if (customValidationResult.validatedResponse) {
@@ -104,22 +139,16 @@ async function handleInputWithAI(sessionId, textInput, source) {
 
   logger.info({ sessionId, intent: finalAiResponse.intent, parameters: finalAiResponse.parameters, source }, 'AI response validated, proceeding to FSM.');
 
-  await redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(finalAiResponse), 'EX', 3600)
-    .catch(err => logger.error({ err }, 'Failed to log fsm_input to Redis'));
+  redisClient.set(`fsm_input:${sessionId}:${Date.now()}`, JSON.stringify(finalAiResponse), 'EX', 3600)
+    .catch(err => logger.error({ err, sessionId }, 'Failed to log fsm_input to Redis'));
 
   const fsmResult = await fsm.processInput(sessionId, finalAiResponse.intent, finalAiResponse.parameters);
 
-  // FSM output is logged by FSM itself or by the calling interface (apiServer, etc.)
-  // For consistency, let's ensure it's logged here too if not elsewhere.
-  // fsm.processInput now returns sessionData which includes the output.
-  // The actual response sent to the client (apiServer, socketServer) will be logged there.
-  // Here we log what FSM produced internally.
-  await redisClient.set(`fsm_output:${sessionId}:${Date.now()}`, JSON.stringify(fsmResult), 'EX', 3600)
-    .catch(err => logger.error({ err }, 'Failed to log fsm_output to Redis'));
+  redisClient.set(`fsm_output:${sessionId}:${Date.now()}`, JSON.stringify(fsmResult), 'EX', 3600)
+    .catch(err => logger.error({ err, sessionId }, 'Failed to log fsm_output to Redis'));
 
   return fsmResult;
 }
-
 
 async function main() {
   logger.info(`Valor de process.env.ENABLE_API: ${process.env.ENABLE_API}`);
@@ -133,16 +162,16 @@ async function main() {
 
   try {
     logger.info('Inicializando aplicación FSM...');
-    loadStateConfig(); // FSM states
-    jsonValidator.loadSchema(); // AI Response JSON Schema
-    loadAIPrompt(); // AI Prompt
+    loadStateConfig();
+    jsonValidator.loadSchema();
+    loadAIPrompt();
 
     await redisClient.connect();
     logger.info('Conexión con Redis establecida.');
 
     const enableApi = process.env.ENABLE_API !== 'false';
     if (enableApi) {
-      startApiServer(handleInputWithAI); // Pass the AI handler
+      startApiServer(handleInputWithAI);
     } else {
       logger.info('Módulo API está deshabilitado por configuración (ENABLE_API=false).');
     }
@@ -150,7 +179,7 @@ async function main() {
     const enableAri = process.env.ENABLE_ARI !== 'false';
     if (enableAri) {
       logger.info('Intentando conectar a Asterisk ARI...');
-      await connectAri(handleInputWithAI); // Pass the AI handler
+      await connectAri(handleInputWithAI);
       ariConnected = true;
       logger.info('Módulo ARI iniciado (o intentando conectar).');
     } else {
@@ -161,7 +190,7 @@ async function main() {
     const fsmSocketPath = process.env.FSM_SOCKET_PATH;
     if (enableSocketServer) {
       if (fsmSocketPath) {
-        startSocketServer(fsmSocketPath, handleInputWithAI); // Pass the AI handler
+        startSocketServer(fsmSocketPath, handleInputWithAI);
         socketServerStarted = true;
       } else {
         logger.warn('ADVERTENCIA: ENABLE_SOCKET_SERVER está en true, pero FSM_SOCKET_PATH no está definido. El servidor de sockets no se iniciará.');

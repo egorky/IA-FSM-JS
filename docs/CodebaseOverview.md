@@ -1,6 +1,6 @@
-# Visión General del Código Base - Servicio FSM con IA
+# Visión General del Código Base - Servicio FSM con IA y Simulación de API
 
-Este documento proporciona una explicación detallada de cada archivo principal y pieza de código dentro del proyecto del Servicio FSM, ahora con integración de IA.
+Este documento proporciona una explicación detallada de cada archivo principal y pieza de código dentro del proyecto del Servicio FSM, ahora con integración de IA y simulación de llamadas a API externas.
 
 ## Estructura del Proyecto Actualizada
 
@@ -13,6 +13,8 @@ Este documento proporciona una explicación detallada de cada archivo principal 
 │   └── customAIResponseValidator.js # (NUEVO) Validador JS personalizado para respuesta de IA
 ├── docs/
 │   └── CodebaseOverview.md         # Este archivo
+├── scripts/
+│   └── simulateApiResponder.js     # (NUEVO) Script para simular respuestas de API externas
 ├── src/
 │   ├── index.js                    # Punto de entrada de la aplicación, orquesta la inicialización
 │   ├── logger.js                   # (NUEVO) Configuración del logger (Pino)
@@ -22,9 +24,9 @@ Este documento proporciona una explicación detallada de cada archivo principal 
 │   ├── ariClient.js                # Cliente Asterisk ARI, adaptado para flujo con IA
 │   ├── socketServer.js             # Servidor de Sockets UNIX, adaptado para flujo con IA
 │   ├── configLoader.js             # Carga y valida states.json
-│   ├── fsm.js                      # Lógica central de la FSM, recibe entrada de IA
-│   ├── redisClient.js              # Cliente para interactuar con Redis (sesiones y logs IA/FSM)
-│   └── templateProcessor.js        # Procesa `payloadResponse` de la FSM (sin cambios mayores)
+│   ├── fsm.js                      # Lógica central de la FSM, recibe entrada de IA, simula triggers de API
+│   ├── redisClient.js              # Cliente para interactuar con Redis (sesiones y logs IA/FSM/API)
+│   └── templateProcessor.js        # Procesa `payloadResponse` de la FSM y `externalApiCall`
 ├── .env.example                    # Ejemplo de variables de entorno (actualizado)
 ├── AGENTS.md                       # Instrucciones para agentes AI (actualizado)
 ├── FSM_Documentation.md            # Documentación general y casos de uso (actualizado)
@@ -37,128 +39,81 @@ Este documento proporciona una explicación detallada de cada archivo principal 
 A continuación, se detalla cada componente principal:
 
 ### 1. `package.json` (Actualizado)
-   - **Propósito**: Manifiesto del proyecto.
-   - **Dependencias Clave Adicionales**:
-     - `openai`, `@google/generative-ai`, `groq-sdk`: SDKs para interactuar con los respectivos proveedores de IA.
-     - `ajv`: Para la validación de esquemas JSON (usado en `jsonValidator.js`).
-     - `pino`: Para logging estructurado y asíncrono.
-   - **Dependencias de Desarrollo Adicionales**:
-     - `pino-pretty`: Para formatear logs de `pino` en desarrollo.
-   - Las dependencias originales (`express`, `ioredis`, `ari-client`, `dotenv`, `isolated-vm`) permanecen.
+   - Mantiene las dependencias anteriores y añade `openai`, `@google/genai`, `groq-sdk`, `ajv`, `pino`, y `pino-pretty`.
 
 ### 2. Carpeta `config/` (Actualizada)
-   - `states.json`: Sin cambios estructurales fundamentales. Sigue definiendo los estados, transiciones y `payloadResponse` de la FSM.
-   - `aiPrompt.txt` (NUEVO):
-     - **Propósito**: Contiene el texto del prompt que se envía al servicio de IA. Este prompt guía a la IA para que entienda el texto del usuario y devuelva un JSON estructurado con `intent` y `parameters`.
-   - `aiResponseSchema.json` (NUEVO):
-     - **Propósito**: Define un esquema JSON que se utiliza para validar la estructura de la respuesta JSON proveniente del servicio de IA. Asegura que la IA devuelva los campos esperados (como `intent` y `parameters`) con los tipos correctos.
-   - `customAIResponseValidator.js` (NUEVO):
-     - **Propósito**: Exporta una función `validateAIResponse(jsonResponse)` que permite implementar lógica de validación personalizada más allá de lo que el esquema JSON puede cubrir. Por ejemplo, verificar condicionalmente la presencia de ciertos parámetros basados en la `intent` detectada.
+   - `states.json`:
+     - **Nuevo**: Puede contener un objeto `externalApiCall` dentro de `payloadResponse` de un estado. Este objeto define:
+       - `type` (string): Un identificador para el tipo de llamada API (ej: "fetch_doctors_for_specialty").
+       - `requestParams` (object): Parámetros a enviar en la llamada API simulada. Puede usar variables de plantilla (ej: `{ "specialty": "{{medical_specialty}}" }`).
+       - `correlationId` (string): Un ID para rastrear la solicitud/respuesta. Puede usar variables de plantilla (ej: `"corr_{{sessionId}}_{{current_time}}"`).
+   - `aiPrompt.txt`: Prompt para la IA. Actualizado para instruir a la IA sobre cómo considerar el contexto de respuestas de API si se incluye en el texto de entrada.
+   - `aiResponseSchema.json`: Esquema para validar el JSON de la IA.
+   - `customAIResponseValidator.js`: Validador JS personalizado para la respuesta de la IA.
 
 ### 3. `src/index.js` (Actualizado)
-   - **Propósito**: Punto de entrada principal. Ahora también orquesta la inicialización de los servicios de IA, carga el prompt de IA y el esquema de validación.
-   - **Cambios Clave**:
-     - Importa `aiService.js`, `jsonValidator.js`, `logger.js`, y `customAIResponseValidator.js`.
-     - Carga el contenido de `config/aiPrompt.txt`.
-     - Define una función `handleInputWithAI(sessionId, textInput, source)`:
-       - Esta función es el nuevo punto central para procesar la entrada del usuario.
-       - Llama a `aiService.getAIResponse()` para obtener el JSON estructurado de la IA.
-       - Realiza la validación del JSON de la IA (esquema y personalizada).
-       - Maneja fallos de la IA o de validación, posiblemente usando intents de fallback.
-       - Pasa el `intent` y `parameters` resultantes a `fsm.processInput()`.
-       - Orquesta el logging en Redis de las diferentes etapas (entrada de texto, E/S de IA, entrada a FSM, salida de FSM).
-     - Pasa `handleInputWithAI` a `apiServer.js`, `socketServer.js`, y `ariClient.js` para que estas interfaces la utilicen.
-     - Usa `logger.js` para todo el logging.
+   - **Cambios Clave en `handleInputWithAI(sessionId, textInput, source)`**:
+     - **Comprobación de Respuestas de API Simuladas**: Antes de llamar a `aiService.getAIResponse`, llama a una nueva función interna `checkForAndCombineApiResponse(sessionId, currentText)`.
+       - `checkForAndCombineApiResponse`: Usa `redisClient.getClient().scan()` para buscar claves en Redis que coincidan con el patrón `api_response:{sessionId}:*`.
+       - Si encuentra una clave, recupera el JSON de respuesta de la API simulada, la elimina de Redis para evitar reprocesamiento.
+       - Combina el texto original del usuario con la respuesta de la API formateada como: `Texto del usuario\n\n[API Response Context: {JSON de la respuesta API}]`.
+     - El texto (potencialmente combinado) se pasa a `aiService.getAIResponse`.
+     - Se registra el texto combinado en Redis (`ai_actual_input:...`).
+     - El resto del flujo (validación, llamada a FSM, logging de FSM I/O) permanece similar pero opera sobre los datos potencialmente enriquecidos.
 
-### 4. `src/logger.js` (NUEVO)
-   - **Propósito**: Configura una instancia centralizada del logger `pino`.
-   - **Funcionalidad**:
-     - Permite logging estructurado.
-     - Configura `pino-pretty` para logs legibles en desarrollo y JSON en producción.
-     - El nivel de log (`LOG_LEVEL`) y el entorno (`NODE_ENV`) se configuran mediante variables de entorno.
+### 4. `src/logger.js`
+   - Configuración de `pino`.
 
-### 5. `src/aiService.js` (NUEVO)
-   - **Propósito**: Encapsula la lógica para interactuar con los diferentes proveedores de IA.
-   - **Funcionalidad**:
-     - Inicializa los clientes de SDK para OpenAI, Google Gemini y Groq basándose en las variables de entorno (`AI_PROVIDER` y las claves API correspondientes).
-     - Expone una función principal `getAIResponse(textInput, promptContent)` que:
-       - Selecciona el proveedor de IA configurado.
-       - Construye el mensaje/prompt completo para la IA.
-       - Realiza la llamada a la API del proveedor de IA.
-       - Espera una respuesta JSON y la parsea.
-       - Incluye timeouts configurables para las solicitudes a la IA.
-     - Realiza logging asíncrono de la entrada enviada a la IA y la salida recibida de la IA hacia Redis.
-     - Maneja errores específicos de cada proveedor.
+### 5. `src/aiService.js`
+   - Interactúa con proveedores de IA. Sin cambios funcionales mayores en esta iteración.
 
-### 6. `src/jsonValidator.js` (NUEVO)
-   - **Propósito**: Valida la respuesta JSON obtenida del `aiService.js`.
-   - **Funcionalidad**:
-     - Carga el esquema desde `config/aiResponseSchema.json` al iniciar.
-     - Utiliza la librería `ajv` para compilar el esquema y validar objetos JSON contra él.
-     - Expone una función `validateJson(jsonResponse)` que devuelve un objeto `{ isValid: boolean, errors: object[] | null }`.
-     - Registra los resultados de la validación usando `logger.js`.
+### 6. `src/jsonValidator.js`
+   - Valida la respuesta JSON de la IA. Sin cambios funcionales mayores en esta iteración.
 
 ### 7. `src/configLoader.js`
-   - **Propósito**: Carga y valida `config/states.json`. (Sin cambios funcionales mayores, pero ahora usa `logger.js`).
-   - **Validaciones**: Sigue validando la estructura de `states.json`, `initialState`, etc. Usa `logger.js` para los mensajes.
+   - Carga `config/states.json`. Usa `logger.js`.
 
-### 8. `src/redisClient.js`
-   - **Propósito**: Encapsula la interacción con Redis. (Sin cambios funcionales mayores, pero ahora usa `logger.js`).
-   - **Uso Extendido**: Además de las sesiones FSM, ahora se utiliza para registrar de forma asíncrona:
-     - Texto de entrada original del usuario.
-     - Solicitud enviada a la IA.
-     - Respuesta recibida de la IA.
-     - JSON de entrada (intent/parameters) para la FSM.
-     - Salida completa de la FSM.
+### 8. `src/redisClient.js` (Actualizado)
+   - **Uso Extendido para Simulación de API**:
+     - `LPUSH` a `fsm_api_request_queue`: Usado por `fsm.js` para "enviar" solicitudes de API simuladas.
+     - `RPOP` de `fsm_api_request_queue`: Usado por `scripts/simulateApiResponder.js` para leer estas solicitudes.
+     - `SETEX` para `api_response:{sessionId}:{correlationId}`: Usado por `scripts/simulateApiResponder.js` para guardar respuestas simuladas.
+     - `GET` y `DEL` para `api_response:{sessionId}:{correlationId}`: Usado por `src/index.js` para consumir estas respuestas.
+     - `SCAN`: Usado por `src/index.js` para buscar claves de respuesta de API.
 
 ### 9. `src/fsm.js` (Actualizado)
-   - **Propósito**: Lógica central de la FSM. La forma en que procesa estados, transiciones y `payloadResponse` no cambia fundamentalmente.
-   - **Cambios Clave**:
-     - Ahora recibe `intent` y `parameters` que han sido pre-procesados por la capa de IA.
-     - Todo el logging interno se reemplaza por llamadas a `logger.js`.
-     - El guardado de la sesión en Redis (`redisClient.set`) se realiza de forma asíncrona (sin `await` en la ruta crítica de `processInput`) utilizando una función helper `saveSessionAsync` para no bloquear.
+   - **Cambios Clave en `processInput()`**:
+     - Después de determinar `nextStateConfig` y renderizar `payloadResponse` con `processTemplate`:
+       - Verifica si `nextStateConfig.payloadResponse.externalApiCall` está definido.
+       - Si existe, se realiza una copia profunda de este objeto.
+       - Los campos `requestParams` (si es un objeto) y `correlationId` (si es un string) dentro de `externalApiCall` se procesan con `processTemplate` usando `currentParameters` para resolver cualquier variable de plantilla.
+       - Se construye un objeto `apiRequest` con `sessionId`, `correlationId` renderizado (con fallback a uno generado con timestamp), `type`, `requestParams` renderizados, y un `timestamp`.
+       - Se llama a una nueva función `sendApiRequestAsync(apiRequest)` que hace `LPUSH` del `apiRequest` (serializado a JSON) a la lista `fsm_api_request_queue` en Redis de forma asíncrona.
+   - Logging actualizado a `logger.js`.
+   - Guardado de sesión sigue siendo asíncrono.
 
-### 10. `src/templateProcessor.js`
-    - **Propósito**: Procesa los strings de plantilla en `payloadResponse`. (Sin cambios funcionales mayores, pero usa `logger.js` para errores).
+### 10. `src/templateProcessor.js` (Actualizado)
+    - **Uso Extendido**: Su función `processTemplate` ahora también es utilizada por `fsm.js` para renderizar los campos dentro del objeto `externalApiCall` (específicamente `requestParams` y `correlationId`).
 
-### 11. `src/apiServer.js` (Actualizado)
-    - **Propósito**: Servidor API Express.
-    - **Cambios Clave**:
-      - Ahora espera `Content-Type: text/plain` para el endpoint `POST /fsm/:sessionId`. El cuerpo de la solicitud es el texto del usuario.
-      - Utiliza `express.text()` para parsear este tipo de cuerpo y `express.json()` para otros, con límites de payload configurables.
-      - Llama a la función `handleInputWithAI` (proporcionada por `index.js`) para procesar el texto.
-      - La respuesta JSON de la FSM (obtenida de `handleInputWithAI`) se devuelve al cliente.
-      - Logging actualizado a `logger.js`.
-      - Registra la salida final de la FSM para esta interfaz en Redis.
+### 11. `src/apiServer.js`, `src/socketServer.js`, `src/ariClient.js` (Actualizados)
+    - Delegan el procesamiento de entrada a `handleInputWithAI` de `src/index.js`. Sin cambios funcionales mayores en esta iteración más allá de lo ya implementado para el flujo de IA.
 
-### 12. `src/socketServer.js` (Actualizado)
-    - **Propósito**: Servidor de sockets UNIX.
-    - **Cambios Clave**:
-      - Ahora espera que el cliente envíe un objeto JSON con los campos `sessionId` y `textInput`.
-      - Extrae `textInput` y lo pasa a la función `handleInputWithAI` (proporcionada por `index.js`).
-      - La respuesta JSON de la FSM se devuelve al cliente a través del socket.
-      - Logging actualizado a `logger.js`.
-      - Registra la salida final de la FSM para esta interfaz en Redis.
+### 12. `.env.example` (Actualizado)
+    - Sin cambios directos en esta iteración, pero las variables existentes para Redis son usadas por el nuevo mecanismo de simulación.
 
-### 13. `src/ariClient.js` (Actualizado)
-    - **Propósito**: Cliente para Asterisk ARI.
-    - **Cambios Clave**:
-      - Cuando se recibe una nueva llamada (`StasisStart`) o entrada DTMF, se construye un `textInput` apropiado (ej: "Nueva llamada de X", "DTMF presionado: 123").
-      - Este `textInput` se pasa a la función `handleInputWithAI` (proporcionada por `index.js`).
-      - La respuesta de la FSM se utiliza para decidir las acciones ARI (ej: reproducir audios del `payloadResponse`, solicitar más información basada en `parametersToCollect`).
-      - Se incluye una lógica básica para `playPrompt` y un esqueleto para `handleDtmfReceived`.
-      - Logging actualizado a `logger.js`.
-      - Registra entradas y salidas relevantes de ARI/FSM en Redis.
-
-### 14. `.env.example` (Actualizado)
-    - **Propósito**: Archivo de ejemplo para variables de entorno.
-    - **Nuevas Variables**:
-        - `LOG_LEVEL`, `NODE_ENV`: Para configurar `pino`.
-        - `API_JSON_PAYLOAD_LIMIT`, `API_TEXT_PAYLOAD_LIMIT`: Para configurar límites de Express.
-        - `AI_PROVIDER`: Para seleccionar entre `openai`, `google`, `groq`.
-        - `AI_REQUEST_TIMEOUT`: Timeout para llamadas a la IA.
-        - Claves API específicas del proveedor: `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`.
-        - Configuraciones de modelo y temperatura para cada proveedor: `OPENAI_MODEL`, `OPENAI_TEMPERATURE`, etc.
+### 13. `scripts/simulateApiResponder.js` (NUEVO)
+    - **Propósito**: Script independiente para simular un respondedor de API externo.
+    - **Funcionalidad**:
+        - Carga variables de `.env`.
+        - Conecta a Redis.
+        - Entra en un bucle de sondeo (`pollQueue`) que periódicamente (cada `POLLING_INTERVAL_MS`):
+            - Intenta `RPOP` una solicitud de la lista `fsm_api_request_queue`.
+            - Si obtiene una solicitud:
+                - Parsea el JSON.
+                - Basado en el campo `type` de la solicitud (ej: `fetch_doctors_for_specialty`), genera una respuesta JSON mock.
+                - Incluye el `correlationId` y `sessionId` originales en la respuesta o al guardarla.
+                - Guarda la respuesta JSON en Redis usando una clave como `api_response:{sessionId}:{correlationId}` con un TTL (`RESPONSE_TTL_SECONDS`).
+        - Incluye manejo básico de errores y cierre ordenado.
 
 ---
 *Fin del documento.*

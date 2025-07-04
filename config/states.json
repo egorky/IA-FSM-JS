@@ -81,7 +81,15 @@
           "beforeCollectingParameters": [],
           "afterParametersCollected": ["api_validate_chosen_specialty"]
         },
-        "tools": { "specialtySelector": "dropdown" }
+        "tools": { "specialtySelector": "dropdown" },
+        "externalApiCall": {
+          "type": "fetch_doctors_for_specialty",
+          "requestParams": {
+            "specialty": "{{medical_specialty}}",
+            "locationPreference": "{{preferred_office_id}}"
+          },
+          "correlationId": "fetch_docs_{{sessionId}}_{{current_time}}"
+        }
       },
       "transitions": [
         {
