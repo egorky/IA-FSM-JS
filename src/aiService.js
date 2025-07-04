@@ -1,6 +1,6 @@
 // src/aiService.js
 const OpenAI = require('openai');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { GoogleGenerativeAI } = require('@google/genai');
 const Groq = require('groq-sdk');
 const redisClient = require('./redisClient');
 const logger = require('./logger'); // Assuming pino logger is set up in logger.js
