@@ -80,17 +80,10 @@ async function getGoogleGeminiResponse(textInput, prompt) {
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            intent: { type: Type.STRING },
-            parameters: {
-              type: Type.OBJECT,
-              // We can't easily define arbitrary key-value pairs for parameters here
-              // without knowing all possible parameters.
-              // So, we allow additional properties for the parameters object.
-              // For stricter validation, a more detailed schema would be needed if
-              // the set of parameters were fixed.
-            }
+            intent: { type: Type.STRING, description: "The user's determined intent." },
+            parameters_json_string: { type: Type.STRING, description: "A JSON string representing the parameters object." }
           },
-          required: ["intent", "parameters"]
+          required: ["intent", "parameters_json_string"]
         },
         temperature: parseFloat(process.env.GEMINI_TEMPERATURE) || 0.7,
         // topP: ..., // Other generation config if needed
@@ -104,22 +97,40 @@ async function getGoogleGeminiResponse(textInput, prompt) {
     // Let's assume response.text() is the primary way as per documentation for schema usage.
     // If the API directly returns a JSON object in a specific field when schema is used, that would be better.
     // For now, we rely on response.text() and then JSON.parse.
-
-    // The generateContent directly returns the GenerateContentResponse object
-    // which has a text() method.
     const responseText = response.text();
 
     if (!responseText) {
       throw new Error('Google Gemini response text is empty, even with responseSchema.');
     }
 
-    // No need to extract from markdown ```json ... ``` if responseMimeType and responseSchema work as expected.
-    // The model should directly output JSON.
     await logToRedis(`ai_output:google:${Date.now()}`, { response: responseText });
-    return JSON.parse(responseText);
+    const parsedResponse = JSON.parse(responseText);
+
+    // Now, parse the parameters_json_string
+    let finalParameters = {};
+    if (parsedResponse.parameters_json_string) {
+      try {
+        finalParameters = JSON.parse(parsedResponse.parameters_json_string);
+      } catch (e) {
+        logger.warn({ err: e, parameters_json_string: parsedResponse.parameters_json_string },
+          "Failed to parse parameters_json_string from Gemini response. Defaulting to empty parameters object.");
+        // Keep finalParameters as {}
+      }
+    }
+    return { intent: parsedResponse.intent, parameters: finalParameters };
 
   } catch (error) {
-    logger.error({ err: error, textInput, prompt }, 'Error getting response from Google Gemini');
+    // If the error is an ApiError from Google, it might have a more specific JSON payload in its message
+    if (error.name === 'ApiError' && error.message) {
+        try {
+            const errorJson = JSON.parse(error.message);
+            logger.error({ err: errorJson, textInput, prompt }, 'Google Gemini API Error');
+        } catch (e) {
+            logger.error({ err: error, textInput, prompt }, 'Error getting response from Google Gemini (non-JSON error message)');
+        }
+    } else {
+        logger.error({ err: error, textInput, prompt }, 'Error getting response from Google Gemini');
+    }
     await logToRedis(`ai_error:google:${Date.now()}`, { error: error.message, textInput, prompt });
     throw error;
   }

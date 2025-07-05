@@ -70,6 +70,19 @@ If no specific parameters are identified, "parameters" should be an empty object
 Do not invent new top-level keys. Stick to "intent" and "parameters".
 Parameter values should be strings. Numbers and booleans are also acceptable if appropriate for the parameter.
 The 'intent' should be a string, using snake_case for multi-word intents.
+
+FOR GOOGLE GEMINI USERS: Instead of a nested "parameters" object, provide a field named "parameters_json_string" which contains the JSON.stringify() version of the parameters object.
+Example for Gemini:
+```json
+{
+  "intent": "schedule_appointment",
+  "parameters_json_string": "{\"medical_specialty\":\"cardiology\",\"appointment_date\":\"tomorrow\",\"appointment_time\":\"3 PM\"}"
+}
+```
+If parameters are empty for Gemini, "parameters_json_string" should be "{}".
+
+FOR OTHER MODELS (like OpenAI, Groq): Continue to use a nested "parameters" object as shown in the primary examples.
+
 Focus on extracting information explicitly stated or strongly implied by the user.
 Your input might also contain specific instructions or data (e.g., from `customInstructions` in a state, or results from synchronous API calls like `sync_api_results.apiName.fieldValue`) embedded within the user's text or as part of the overall context provided to you. Use this information as directed by those instructions to form your output JSON.
 If the input text includes API response data from a *previous turn* (e.g., marked as "[API Response Context for 'apiName' (ID: correlationId): ...]"), use that data to enrich your understanding and extraction of parameters or to help determine the intent. For example, if the user says "Yes, that's correct" and the API context for 'propose_time' shows "{ \"proposedTime\": \"4 PM\" }", you should extract "appointment_time": "4 PM" if relevant to the current intent. If the context shows an error, like "[API Error Context for 'propose_time' (ID: correlationId): {\"message\":\"Slot unavailable\"}]", your response should reflect that you cannot proceed with that time, perhaps by setting a specific intent or parameter.
