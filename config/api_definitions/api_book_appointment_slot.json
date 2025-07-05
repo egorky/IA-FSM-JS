@@ -1,0 +1,24 @@
+{
+  "apiId": "api_book_appointment_slot",
+  "description": "Books an appointment slot.",
+  "url": "https://api.example.com/appointments/book",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}",
+    "X-Correlation-ID": "{{correlationId}}"
+  },
+  "body_template": {
+    "sessionId": "{{sessionId}}",
+    "patientId": "{{id_document_number}}",
+    "patientName": "{{async_api_results.api_get_full_user.name}}",
+    "cityId": "{{sync_api_results.api_get_city_id.id}}",
+    "specialtyId": "{{async_api_results.api_list_specialties.speciality_id}}",
+    "officeId": "{{async_api_results.api_get_office_id.id}}",
+    "appointmentDate": "{{appointment_date}}",
+    "appointmentTime": "{{appointment_time}}",
+    "notes": "Booked via FSM-AI system."
+  },
+  "timeout_ms": 10000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

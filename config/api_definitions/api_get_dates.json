@@ -1,0 +1,17 @@
+{
+  "apiId": "api_get_dates",
+  "description": "Fetches available dates for a given office, specialty.",
+  "url": "https://api.example.com/appointments/available-dates",
+  "method": "GET",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}"
+  },
+  "query_params_template": {
+    "office_id": "{{async_api_results.api_get_office_id.id}}",
+    "specialty_id": "{{async_api_results.api_list_specialties.speciality_id}}",
+    "start_date": "{{current_date}}"
+  },
+  "timeout_ms": 4000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

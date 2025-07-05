@@ -1,139 +1,188 @@
 const Redis = require('ioredis');
+const logger = require('./logger'); // Assuming logger.js is in the same directory or proper path
 
-// Configuración de Redis. Debería moverse a variables de entorno en una aplicación real.
 const redisConfig = {
   host: process.env.REDIS_HOST || '127.0.0.1',
-  port: process.env.REDIS_PORT || 6379,
-  // password: process.env.REDIS_PASSWORD || undefined, // Descomentar si Redis tiene contraseña
-  // db: process.env.REDIS_DB || 0, // Descomentar si se usa una DB específica
+  port: parseInt(process.env.REDIS_PORT, 10) || 6379,
+  password: process.env.REDIS_PASSWORD || undefined,
+  db: parseInt(process.env.REDIS_DB, 10) || 0,
+  maxRetriesPerRequest: process.env.REDIS_MAX_RETRIES ? parseInt(process.env.REDIS_MAX_RETRIES, 10) : 3,
+  retryStrategy(times) {
+    const delay = Math.min(times * 50, 2000); // Exponential backoff
+    logger.warn({ attempt: times, delay }, 'Redis: Reconnecting...');
+    return delay;
+  },
 };
 
 let client;
-let connectionPromise;
+let subscriberClient; // Separate client for blocking operations like XREAD
 
-/**
- * Establece la conexión con el servidor Redis.
- * Devuelve una promesa que se resuelve cuando la conexión está lista.
- */
-function connect() {
-  if (!client) {
-    client = new Redis(redisConfig);
-
-    client.on('connect', () => {
-      console.log('Conectado a Redis.');
-    });
-
-    client.on('error', (err) => {
-      console.error('Error de conexión con Redis:', err);
-      // En una aplicación real, podrías querer reintentar la conexión o terminar la aplicación
-      // si Redis es crítico.
-      // Por ahora, si hay un error en la conexión inicial, las operaciones fallarán.
-      client = null; // Resetear cliente para permitir reintentos si se implementa
-      connectionPromise = null; // Resetear promesa
-    });
-
-    client.on('close', () => {
-        console.log('Conexión con Redis cerrada.');
-        client = null;
-        connectionPromise = null;
-    });
-
-    client.on('reconnecting', () => {
-        console.log('Reconectando a Redis...');
-    });
-
-    // Creamos una promesa para asegurar que las operaciones esperan a que la conexión esté lista.
-    // Sin embargo, ioredis maneja una cola de comandos internamente, por lo que
-    // las llamadas a get/set pueden funcionar incluso antes de que el evento 'connect' se dispare explícitamente.
-    // Pero es buena práctica tener una forma de saber si la conexión es viable.
-    connectionPromise = new Promise((resolve, reject) => {
-        client.once('connect', resolve);
-        client.once('error', reject); // Rechazar si la conexión inicial falla
+async function connect() {
+  if (client && client.status === 'ready') {
+    return client;
+  }
+  if (client && client.status === 'connecting') {
+    // If already connecting, wait for it to complete
+    return new Promise((resolve, reject) => {
+      client.once('ready', () => resolve(client));
+      client.once('error', (err) => reject(err)); // Error during this specific connection attempt
     });
   }
-  return connectionPromise;
+
+  logger.info(redisConfig, 'Redis: Attempting to connect with config.');
+  client = new Redis(redisConfig);
+
+  return new Promise((resolve, reject) => {
+    client.once('ready', () => {
+      logger.info('Redis: Main client connected successfully.');
+      resolve(client);
+    });
+    client.on('error', (err) => { // General error handler for the client's lifetime
+      logger.error({ err }, 'Redis: Main client connection error.');
+      // For initial connection, reject the promise. For ongoing errors, it will attempt to reconnect.
+      if (client && client.status !== 'ready') { // Check if it's an initial connection error
+          reject(err);
+      }
+    });
+    client.on('close', () => logger.info('Redis: Main client connection closed.'));
+    // 'reconnecting' is handled by retryStrategy
+  });
 }
 
-/**
- * Obtiene un valor de Redis.
- * @param {string} key La clave a obtener.
- * @returns {Promise<string | null>} El valor o null si la clave no existe.
- */
-async function get(key) {
-  if (!client) {
-    // Intenta conectar si el cliente no está inicializado.
-    // Esto es un fallback, idealmente connect() se llama al inicio de la app.
-    await connect().catch(err => {
-        console.error("Fallo al autoconectar Redis en GET:", err);
-        throw new Error("Redis no está conectado."); // Lanza error si no se puede conectar
-    });
-  }
-  // Si después de intentar conectar, el cliente sigue sin estar disponible, lanza error.
-  if (!client) throw new Error("Redis no está conectado y no se pudo establecer conexión.");
+async function getSubscriberClient() {
+    if (subscriberClient && subscriberClient.status === 'ready') {
+        return subscriberClient;
+    }
+    if (subscriberClient && subscriberClient.status === 'connecting') {
+        return new Promise((resolve, reject) => {
+            subscriberClient.once('ready', () => resolve(subscriberClient));
+            subscriberClient.once('error', (err) => reject(err));
+        });
+    }
+    logger.info(redisConfig, 'Redis: Attempting to connect subscriber client.');
+    subscriberClient = new Redis(redisConfig); // Uses the same config
 
+    return new Promise((resolve, reject) => {
+        subscriberClient.once('ready', () => {
+            logger.info('Redis: Subscriber client connected successfully.');
+            resolve(subscriberClient);
+        });
+        subscriberClient.on('error', (err) => {
+            logger.error({ err }, 'Redis: Subscriber client connection error.');
+             if (subscriberClient && subscriberClient.status !== 'ready') {
+                reject(err);
+            }
+        });
+        subscriberClient.on('close', () => logger.info('Redis: Subscriber client connection closed.'));
+    });
+}
+
+
+async function get(key) {
+  if (!client || client.status !== 'ready') await connect();
   return client.get(key);
 }
 
-/**
- * Guarda un valor en Redis.
- * @param {string} key La clave a guardar.
- * @param {string} value El valor a guardar.
- * @param {string} [mode] Modo de SET, ej: 'EX' para expiración.
- * @param {number} [duration] Duración para el modo, ej: 3600 para 1 hora con 'EX'.
- * @returns {Promise<string>} 'OK' si se guardó correctamente.
- */
 async function set(key, value, mode, duration) {
-  if (!client) {
-    await connect().catch(err => {
-        console.error("Fallo al autoconectar Redis en SET:", err);
-        throw new Error("Redis no está conectado.");
-    });
-  }
-  if (!client) throw new Error("Redis no está conectado y no se pudo establecer conexión.");
-
+  if (!client || client.status !== 'ready') await connect();
   if (mode && duration) {
     return client.set(key, value, mode, duration);
   }
   return client.set(key, value);
 }
 
-/**
- * Elimina una clave de Redis.
- * @param {string} key La clave a eliminar.
- * @returns {Promise<number>} El número de claves eliminadas.
- */
 async function del(key) {
-  if (!client) {
-    await connect().catch(err => {
-        console.error("Fallo al autoconectar Redis en DEL:", err);
-        throw new Error("Redis no está conectado.");
-    });
-  }
-  if (!client) throw new Error("Redis no está conectado y no se pudo establecer conexión.");
+  if (!client || client.status !== 'ready') await connect();
   return client.del(key);
 }
 
-/**
- * Cierra la conexión a Redis.
- * Es importante llamar a esto al apagar la aplicación para liberar recursos.
- */
+async function lpush(key, value) {
+    if (!client || client.status !== 'ready') await connect();
+    return client.lpush(key, value);
+}
+
+async function rpop(key) {
+    if (!client || client.status !== 'ready') await connect();
+    return client.rpop(key);
+}
+
+async function xadd(streamKey, id, ...args) {
+    if (!client || client.status !== 'ready') await connect();
+    // args should be field-value pairs, e.g., ['field1', 'value1', 'field2', 'value2']
+    return client.xadd(streamKey, id, ...args);
+}
+
+async function xreadgroup(groupName, consumerName, streams, blockMs = 0, count = 1) {
+    const subClient = await getSubscriberClient(); // Use separate client for blocking
+    const commandArgs = ['GROUP', groupName, consumerName, 'COUNT', count];
+    if (blockMs > 0) {
+        commandArgs.push('BLOCK', blockMs);
+    }
+    commandArgs.push('STREAMS', ...streams); // streams is an array like [streamKey, idToReadFrom]
+    // Example: streams = ['mystream', '>'] for new messages
+    // Example: streams = ['mystream', '0'] for all pending messages for this consumer if group exists
+    return subClient.xreadgroup(...commandArgs);
+}
+
+async function xack(streamKey, groupName, ...messageIds) {
+    if (!client || client.status !== 'ready') await connect();
+    return client.xack(streamKey, groupName, ...messageIds);
+}
+
+async function xgroupCreate(streamKey, groupName, id = '$', mkstream = false) {
+    if (!client || client.status !== 'ready') await connect();
+    const args = [streamKey, groupName, id];
+    if (mkstream) {
+        args.push('MKSTREAM');
+    }
+    try {
+        await client.xgroup('CREATE', ...args);
+        logger.info({ streamKey, groupName }, `Redis: Consumer group created (or already exists and $ was used).`);
+        return true;
+    } catch (error) {
+        if (error.message.includes('BUSYGROUP')) {
+            logger.warn({ streamKey, groupName }, `Redis: Consumer group already exists.`);
+            return true; // Group already exists, which is fine.
+        }
+        logger.error({ err: error, streamKey, groupName }, `Redis: Error creating consumer group.`);
+        throw error;
+    }
+}
+
+
 async function quit() {
   if (client) {
-    await client.quit();
+    try {
+      await client.quit();
+      logger.info('Redis: Main client disconnected.');
+    } catch(e) {
+      logger.error({err: e}, "Redis: Error quitting main client");
+    }
     client = null;
-    connectionPromise = null;
-    console.log('Cliente Redis desconectado.');
+  }
+  if (subscriberClient) {
+    try {
+      await subscriberClient.quit();
+      logger.info('Redis: Subscriber client disconnected.');
+    } catch(e) {
+      logger.error({err: e}, "Redis: Error quitting subscriber client");
+    }
+    subscriberClient = null;
   }
 }
 
-// Exportar una instancia o funciones. Por simplicidad, exportamos las funciones.
-// La conexión se manejará internamente al llamar a las funciones si no está ya establecida.
-// Es recomendable llamar a `connect()` explícitamente al inicio de la aplicación.
 module.exports = {
-  connect, // Para conectar explícitamente al inicio
+  connect,
+  getSubscriberClient, // For direct use if needed elsewhere for subscriptions
   get,
   set,
   del,
-  quit,   // Para desconectar limpiamente al apagar
-  getClient: () => client // Para acceder al cliente directamente si es necesario (ej. para pub/sub)
+  lpush,
+  rpop,
+  xadd,
+  xreadgroup,
+  xack,
+  xgroupCreate,
+  quit,
+  getClient: () => client,
 };

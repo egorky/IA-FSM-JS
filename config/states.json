@@ -1,55 +1,50 @@
 {
-  "initialState": "1_welcome_and_age",
+  "initialState": "1_welcome",
   "states": {
-    "1_welcome_and_age": {
-      "id": "1_welcome_and_age",
-      "description": "Dar la bienvenida al paciente y capturar su edad para definir el nivel de formalidad y verificar elegibilidad inicial.",
+    "1_welcome": {
+      "id": "1_welcome",
+      "description": "Dar la bienvenida al paciente y capturar su número de identificación para extraer toda su información.",
       "parameters": {
-        "required": ["patient_age"],
-        "optional": ["caller_name"]
+        "required": ["id_document_number"]
       },
       "payloadResponse": {
-        "greeting": "Hola {{default(caller_name, 'estimado usuario')}}, bienvenido. Hoy es {{current_date}}.",
-        "customInstructions": "Greet the user {{toUpperCase(caller_name)}} warmly and ask for their age. Current time: {{current_time}}",
+        "prompts": {
+          "main": "Estimado cliente, bienvenido. Hoy es {{current_date}}"
+        },
+        "customInstructions": "solicita al cliente su número de identificación. Current time: {{current_time}}",
         "uiHints": { "ageInputType": "number" },
         "apiHooks": {
           "onEnterState": ["api_log_interaction_start"],
-          "beforeCollectingParameters": ["api_fetch_age_prompt_variations"],
-          "afterParametersCollected": ["api_check_age_eligibility", "api_log_age_provided"]
+          "asynchronousCallDispatch": ["api_get_full_user"]
         }
       },
       "transitions": [
         {
-          "nextState": "2_get_patient_id",
+          "nextState": "2_get_city",
           "condition": { "allParametersMet": true }
         },
         {
           "nextState": "99_transfer_to_human",
           "condition": { "intent": "request_human_agent" }
-        },
-        {
-          "nextState": "98_age_ineligible",
-          "condition": { "intent": "age_ineligible_system_detected" }
         }
       ],
-      "defaultNextState": "2_get_patient_id"
+      "defaultNextState": "2_get_city"
     },
-    "2_get_patient_id": {
-      "id": "2_get_patient_id",
-      "description": "Solicitar el número de identificación o cédula del paciente.",
+    "2_get_city": {
+      "id": "2_get_city",
+      "description": "Solicitar al paciente que diga en qué ciudad donde quiere ser atendido. Para saludarlo, se requiere que el resultado de api_get_full_user (asíncrono del estado anterior) esté disponible. Se llama api_get_city_id sincrónicamente.",
       "parameters": {
-        "required": ["patient_id_number"],
-        "optional": ["id_document_type"]
+        "required": ["city_name"]
       },
       "payloadResponse": {
         "prompts": {
-          "main": "Gracias, {{capitalize(caller_name)}}. Por favor, ingrese su número de identificación {{default(id_document_type, '')}}.",
-          "validationExample": "El formato debe ser XXXXXXXXXX."
+          "main": "Gracias, {{ async_api_results.api_get_full_user.name }}. Por favor, dime en qué ciudad quieres ser atendido.",
+          "validationExample": "Las opciones pueden ser: Guayaquil y Quito."
         },
+        "customInstructions": "Utilizando la ciudad que el humano te da: {{city_name}} y el JSON que te entrega los Id de cada ciudad: {{ sync_api_results.api_get_city_id.id }} construye un JSON de salida cuyo key será city_id. Current time: {{current_time}}",
         "apiHooks": {
           "onEnterState": ["api_log_enter_get_id_state"],
-          "beforeCollectingParameters": ["api_verify_id_prerequisites", "api_get_id_input_instructions"],
-          "afterParametersCollected": ["api_validate_id_format", "api_log_id_provided"]
+          "synchronousCallSetup": ["api_get_city_id"]
         }
       },
       "transitions": [
@@ -60,28 +55,27 @@
         {
           "nextState": "99_transfer_to_human",
           "condition": { "intent": "request_human_agent" }
-        },
-        {
-          "nextState": "2_get_patient_id_retry_invalid",
-          "condition": { "intent": "id_invalid_system_detected" }
         }
       ],
       "defaultNextState": "3_get_specialty"
     },
     "3_get_specialty": {
       "id": "3_get_specialty",
-      "description": "Preguntar por la especialidad médica requerida.",
+      "description": "Preguntar por la especialidad médica requerida. api_list_specialties se llama asincrónicamente para el siguiente ciclo.",
       "parameters": {
         "required": ["medical_specialty"]
       },
       "payloadResponse": {
-        "availableSpecialtiesSource": "dynamic_via_onEnter_api",
         "apiHooks": {
-          "onEnterState": ["api_fetch_available_specialties"],
-          "beforeCollectingParameters": [],
-          "afterParametersCollected": ["api_validate_chosen_specialty"]
+          "onEnterState": ["api_log_fetch_available_specialties"],
+          "asynchronousCallDispatch": ["api_list_specialties"]
         },
-        "tools": { "specialtySelector": "dropdown" }
+        "prompts": {
+          "main": "En qué especialidad médica quieres ser atendido?",
+          "validationExample": "Deben ser especialidades médicas"
+        },
+        "tools": {},
+        "customInstructions": "Utilizando la especialidad que el humano te da: {{medical_specialty}} y el JSON que te entrega los Id de cada especialidad (del próximo ciclo): {{ async_api_results.api_list_specialties.speciality_id }} construye un JSON de salida cuyo key será specialty_id. Current time: {{current_time}}"
       },
       "transitions": [
         {
@@ -97,15 +91,20 @@
     },
     "4_get_office_preference": {
       "id": "4_get_office_preference",
-      "description": "Preguntar si tiene preferencia de oficina o si desea la más cercana/disponible.",
+      "description": "Preguntar si tiene preferencia de sucursal. api_get_office_id se llama asincrónicamente.",
       "parameters": {
-        "optional": ["preferred_office_id", "wants_nearest_office"]
+        "required": ["preferred_office_name"]
       },
       "payloadResponse": {
         "apiHooks": {
-          "onEnterState": ["api_fetch_offices_for_specialty"],
-          "afterParametersCollected": ["api_log_office_preference"]
-        }
+          "onEnterState": ["api_log_office_preference"],
+          "asynchronousCallDispatch": ["api_get_office_id"]
+        },
+        "prompts": {
+          "main": "En qué sucursal quieres ser atendido para la especialidad {{medical_specialty}}?",
+          "validationExample": "Deben ser sucursales válidas"
+        },
+        "customInstructions": "Utilizando la sucursal que el humano prefiere: {{preferred_office_name}} y el JSON que te entrega los Id de cada sucursal (del próximo ciclo): {{ async_api_results.api_get_office_id.preferred_office_id }} construye un JSON de salida cuyo key será office_id. Current time: {{current_time}}"
       },
       "transitions": [
         {
@@ -121,16 +120,20 @@
     },
     "5_get_appointment_day": {
       "id": "5_get_appointment_day",
-      "description": "Pedir al paciente el día en el que desea la cita.",
+      "description": "Pedir al paciente el día en el que desea la cita. api_get_dates se llama asincrónicamente.",
       "parameters": {
         "required": ["appointment_date"]
       },
       "payloadResponse": {
         "uiHints": { "datePickerFormat": "YYYY-MM-DD" },
         "apiHooks": {
-          "beforeCollectingParameters": ["api_check_doctor_availability_for_day_precheck"],
-          "afterParametersCollected": ["api_validate_date_format", "api_check_doctor_availability_for_day_final"]
-        }
+          "asynchronousCallDispatch": ["api_get_dates"]
+        },
+        "prompts": {
+          "main": "Qué día deseas la cita médica?",
+          "validationExample": "Deben ser formato de día a partir de hoy {{current_date}}"
+        },
+        "customInstructions": "Con la fecha que el humano pide: {{appointment_date}} y el JSON que te entrega las fechas disponibles (del próximo ciclo): {{ async_api_results.api_get_dates }} construye un JSON de salida que devuelva las 4 fechas siguientes a partir de hoy {{current_date}}, todas en un JSON con keys possibleDates. Current time: {{current_time}}"
       },
       "transitions": [
         {
@@ -146,15 +149,20 @@
     },
     "6_get_appointment_time": {
       "id": "6_get_appointment_time",
-      "description": "Pedir y confirmar la hora de la cita.",
+      "description": "Pedir y confirmar la hora de la cita. api_book_appointment_slot se llama asincrónicamente.",
       "parameters": {
         "required": ["appointment_time"]
       },
       "payloadResponse": {
         "apiHooks": {
-          "onEnterState": ["api_fetch_available_slots_for_day"],
-          "afterParametersCollected": ["api_book_appointment_slot"]
-        }
+          "onEnterState": ["api_log_date"],
+          "asynchronousCallDispatch": ["api_book_appointment_slot"]
+        },
+        "prompts": {
+          "main": "Para qué hora del día {{appointment_date}} deseas la cita ?",
+          "validationExample": "Deben ser formato de hora a partir de hoy {{current_time}}"
+        },
+        "customInstructions": "Con la hora que el humano pide: {{appointment_time }} y el JSON que te entrega las fechas disponibles (del próximo ciclo): {{ async_api_results.api_book_appointment_slot }} construye un JSON de salida que devuelva las 4 fechas siguientes a partir de la hora en este momento que es {{current_time}}, todas en un JSON con keys possibleTimes."
       },
       "transitions": [
         {
@@ -189,7 +197,7 @@
     },
     "98_age_ineligible": {
       "id": "98_age_ineligible",
-      "description": "Informar al usuario que no es elegible por edad y finalizar.",
+      "description": "Informar al usuario que no es elegible por edad y finalizar. (Ejemplo, no en tu config)",
       "payloadResponse": {
         "messageToUser": "Lo sentimos {{default(caller_name, '')}}, no cumple con el requisito de edad ({{patient_age}}) para este servicio. Registrado a las {{current_time}}.",
         "apiHooks": {
@@ -211,7 +219,7 @@
     },
     "2_get_patient_id_retry_invalid": {
       "id": "2_get_patient_id_retry_invalid",
-      "description": "Informar que la cédula es inválida y solicitarla de nuevo.",
+      "description": "Informar que la cédula es inválida y solicitarla de nuevo. (Ejemplo, no en tu config)",
       "parameters": {
          "required": ["patient_id_number"],
          "optional": ["id_document_type"]
@@ -238,7 +246,7 @@
     },
      "6_retry_appointment_time": {
       "id": "6_retry_appointment_time",
-      "description": "Informar que la hora no está disponible y solicitar otra.",
+      "description": "Informar que la hora no está disponible y solicitar otra. (Ejemplo, no en tu config)",
       "parameters": {
         "required": ["appointment_time"]
       },
