@@ -1,0 +1,15 @@
+{
+  "apiId": "api_get_full_user",
+  "description": "Fetches full user details based on document number.",
+  "url": "https://api.example.com/users/details/{{id_document_number}}",
+  "method": "GET",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}"
+  },
+  "query_params_template": {
+    "include_history": "false"
+  },
+  "timeout_ms": 3000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

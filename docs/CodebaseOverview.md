@@ -1,163 +1,122 @@
-# Visión General del Código Base - Servicio FSM con IA y Llamadas API Asíncronas (Redis Streams)
+# Visión General del Código Base - FSM con IA y API Sincrónicas/Asíncronas (Redis Streams)
 
-Este documento proporciona una explicación detallada de cada archivo principal y pieza de código dentro del proyecto del Servicio FSM, ahora con integración de IA y un mecanismo robusto para llamadas API asíncronas usando Redis Streams.
+Este documento detalla la estructura y flujo del proyecto FSM, ahora con capacidades de IA y manejo diferenciado de llamadas API síncronas y asíncronas.
 
-## Estructura del Proyecto Actualizada
+## Estructura del Proyecto Clave
 
 ```
 .
 ├── config/
-│   ├── states.json                 # Define los estados y la lógica de la FSM
-│   ├── aiPrompt.txt                # Prompt para la IA
-│   ├── aiResponseSchema.json       # Esquema para validar la respuesta de la IA
-│   ├── customAIResponseValidator.js # Validador JS personalizado para respuesta de IA
-│   └── api_definitions/            # (NUEVO) Definiciones de APIs externas
-│       ├── fetch_doctor_availability.json # Ejemplo
-│       └── submit_appointment_booking.json # Ejemplo
+│   ├── states.json                 # Lógica FSM. Ahora con payloadResponse.apiHooks.synchronousCallSetup y .asynchronousCallDispatch
+│   ├── aiPrompt.txt                # Prompt IA (instrucciones para usar sync_api_results y API Response Context)
+│   ├── aiResponseSchema.json       # Esquema validación IA
+│   ├── customAIResponseValidator.js # Validador JS personalizado IA
+│   └── api_definitions/            # Definiciones de API externas (url, method, plantillas, timeout, response_stream_key_template)
+│       └── (ej: fetch_user.json)
 ├── docs/
 │   └── CodebaseOverview.md         # Este archivo
 ├── scripts/
-│   └── simulateApiResponder.js     # Script para simular respuestas de API externas (ahora usa XADD)
+│   └── simulateApiResponder.js     # CLI para XADD respuestas API simuladas a Redis Streams
 ├── src/
-│   ├── index.js                    # Punto de entrada, orquesta flujo IA y espera/lee de Redis Streams
-│   ├── logger.js                   # Configuración del logger (Pino)
-│   ├── aiService.js                # Servicio para interactuar con proveedores de IA
-│   ├── jsonValidator.js            # Validador de JSON para respuestas de IA
-│   ├── apiConfigLoader.js          # (NUEVO) Carga definiciones de API desde config/api_definitions/
-│   ├── apiCallerService.js         # (NUEVO) Realiza llamadas HTTP asíncronas con Axios
-│   ├── apiServer.js                # Servidor API Express
-│   ├── ariClient.js                # Cliente Asterisk ARI
-│   ├── socketServer.js             # Servidor de Sockets UNIX
-│   ├── configLoader.js             # Carga y valida states.json
-│   ├── fsm.js                      # Lógica FSM, dispara llamadas API vía apiCallerService, gestiona pendingApiResponses
-│   ├── redisClient.js              # Cliente Redis, ahora con funciones para Streams y cliente subscriber
-│   └── templateProcessor.js        # Procesa plantillas
-├── .env.example                    # Ejemplo de variables de entorno (actualizado)
-├── AGENTS.md                       # Instrucciones para agentes AI (actualizado)
-├── FSM_Documentation.md            # Documentación general y casos de uso (actualizado)
-├── package.json                    # Dependencias y scripts (actualizado con axios, uuid)
-└── README.md                       # README principal (actualizado)
+│   ├── index.js                    # Orquestador: maneja input, espera/lee de streams, llama IA, llama FSM
+│   ├── logger.js                   # Pino logger
+│   ├── aiService.js                # Interactúa con proveedores IA
+│   ├── jsonValidator.js            # Valida JSON de IA
+│   ├── apiConfigLoader.js          # Carga config/api_definitions/
+│   ├── apiCallerService.js         # Métodos makeRequestAndWait (sync) y makeRequestAsync (async) con Axios
+│   ├── configLoader.js             # Carga states.json
+│   ├── fsm.js                      # Motor FSM: ejecuta sync APIs, lógica de transición, despacha async APIs
+│   ├── redisClient.js              # Cliente Redis: funciones Stream (xadd, xreadgroup, xack, xgroupCreate), cliente subscriber
+│   └── templateProcessor.js        # Procesa plantillas ({{...}})
+├── .env.example                    # Variables de entorno (timeouts API, config Redis Stream)
+├── package.json                    # Dependencias (axios, uuid)
+└── README.md, AGENTS.md, FSM_Documentation.md # Documentación principal (actualizada)
 ```
 
-## Archivos y Módulos
+## Módulos Detallados y Flujo
 
-### 1. `package.json` (Actualizado)
-   - **Dependencias Adicionales**:
-     - `axios`: Para realizar llamadas HTTP en `apiCallerService.js`.
-     - `uuid`: Para generar `correlationId`s únicos en `fsm.js`.
+### 1. `package.json`
+   - Añadidas `axios` (llamadas HTTP) y `uuid` (correlation IDs).
 
-### 2. Carpeta `config/` (Actualizada)
+### 2. `config/api_definitions/` y `src/apiConfigLoader.js`
+   - `api_definitions/`: Contiene archivos JSON por API, definiendo `apiId`, `url`, `method`, plantillas para `headers`, `body_template`, `query_params_template`, `timeout_ms`, y `response_stream_key_template`.
+   - `apiConfigLoader.js`: Carga estas definiciones en memoria al inicio. Provee `getApiConfigById(apiId)`.
+
+### 3. `src/apiCallerService.js` (Actualizado)
+   - `prepareRequestConfig()`: Función interna para procesar plantillas en URL, headers, body, query_params.
+   - `makeRequestAndWait(apiId, sessionId, correlationId, params)`:
+     - Usa `prepareRequestConfig`.
+     - Ejecuta la llamada HTTP con `await axios()`.
+     - Devuelve `{ status: 'success', data: ..., httpCode: ... }` o `{ status: 'error', errorMessage: ..., httpCode: ..., isTimeout: ... }`.
+     - Usado por `fsm.js` para APIs en `synchronousCallSetup`.
+   - `makeRequestAsync(apiId, sessionId, correlationId, params)`:
+     - Usa `prepareRequestConfig`.
+     - Ejecuta `axios()` sin `await` (fire-and-forget).
+     - Registra el despacho. La respuesta real es manejada por un worker externo que escribe al Redis Stream.
+     - Usado por `fsm.js` para APIs en `asynchronousCallDispatch`.
+
+### 4. `src/redisClient.js` (Actualizado)
+   - Mantiene un cliente principal y un `subscriberClient` para operaciones bloqueantes de streams.
+   - Funciones añadidas/mejoradas: `xadd`, `xreadgroup`, `xack`, `xgroupCreate`.
+   - Mejor manejo de conexión/desconexión y logging.
+
+### 5. `config/states.json` y `src/configLoader.js`
    - `states.json`:
-     - **Nuevo**: En `payloadResponse`, puede incluir un array `asyncApiCallsToTrigger`. Cada objeto especifica:
-       - `apiId` (string): Referencia a un archivo en `config/api_definitions/`.
-       - `params` (object): Parámetros para la plantilla de la API (ej: `{ "specialty": "{{medical_specialty}}" }`).
-       - `assignCorrelationIdTo` (string, opcional): Clave bajo la cual se guardará el `correlationId` generado en `sessionData.parameters`.
-   - `api_definitions/` (NUEVO Directorio):
-     - Contiene archivos JSON, uno por cada API externa que el sistema puede llamar.
-     - **Estructura de cada archivo de definición de API** (ej: `fetch_doctor_availability.json`):
-       - `apiId` (string): Identificador único (debe coincidir con el usado en `asyncApiCallsToTrigger`).
-       - `description` (string): Descripción de la API.
-       - `url` (string): URL de la API, puede contener placeholders `{{param}}`.
-       - `method` (string): Método HTTP (GET, POST, PUT, etc.).
-       - `headers` (object): Headers HTTP, los valores pueden ser placeholders.
-       - `query_params_template` (object, opcional para GET): Plantilla para parámetros query, valores pueden ser placeholders.
-       - `body_template` (object/string, opcional para POST/PUT): Plantilla para el cuerpo de la solicitud, puede contener placeholders.
-       - `timeout_ms` (number): Timeout específico para esta API en milisegundos.
-       - `response_stream_key_template` (string): Plantilla para la clave del Redis Stream donde se esperará/escribirá la respuesta de esta API (ej: `"api_responses_stream:{{sessionId}}:{{correlationId}}"`).
-   - `aiPrompt.txt`, `aiResponseSchema.json`, `customAIResponseValidator.js`: Sin cambios funcionales mayores en esta iteración, pero el prompt está preparado para contexto de API.
+     - `payloadResponse.apiHooks.synchronousCallSetup`: Array de `apiId`s. Estas APIs son llamadas por el servidor FSM, y sus respuestas se esperan **dentro del mismo turno de conversación**.
+     - `payloadResponse.apiHooks.asynchronousCallDispatch`: Array de `apiId`s (o definiciones más ricas si se adaptan). Estas APIs son llamadas por el servidor FSM de forma asíncrona (fire-and-forget). Sus respuestas se esperan en un **turno subsecuente** a través de Redis Streams.
+     - Plantillas `{{...}}` pueden ahora usar `{{sync_api_results.apiId.field}}` para acceder a resultados de llamadas síncronas del turno actual, y `{{async_api_results.apiId.field}}` (o similar, dependiendo de cómo `index.js` los guarde) para resultados de llamadas asíncronas de turnos anteriores. `customInstructions` para la IA pueden también usar estos.
+   - `configLoader.js`: Carga `states.json`.
 
-### 3. `src/index.js` (Actualizado)
-   - **`handleInputWithAI(sessionId, clientInput, source)`**:
-     - **Entrada del Cliente**: Ahora puede recibir un objeto como `clientInput` con `{ userInput: "...", waitForCorrelationId: "..." }` para indicar que se debe esperar una respuesta de API específica.
-     - **Carga de Sesión**: Recupera `sessionData` de Redis, que ahora incluye `pendingApiResponses`.
-     - **Espera/Comprobación de Respuestas de API (Redis Streams)**:
-       - Si `waitForCorrelationId` se proporciona y está en `pendingApiResponses`:
-         - Obtiene el `responseStreamKey` de `pendingApiResponses[waitForCorrelationId]`.
-         - Llama a `ensureStreamGroupExists` para ese stream.
-         - Realiza una lectura bloqueante (`redisClient.xreadgroup`) en el stream con un timeout configurable (`REDIS_STREAM_XREAD_BLOCK_WAIT_MS`).
-         - Si se recibe un mensaje: lo parsea (según formato definido en Plan Paso 5), combina `data` o `error` con `userInputText`, hace `XACK`, y elimina la entrada de `pendingApiResponses`.
-         - Si hay timeout: añade un contexto de timeout a `userInputText` y elimina la entrada de `pendingApiResponses`.
-       - También (o si no hay `waitForCorrelationId` explícito): Itera sobre `pendingApiResponses` y realiza lecturas no bloqueantes o con timeout corto (`REDIS_STREAM_XREAD_BLOCK_MS_PER_ITEM`) en los streams correspondientes, procesando los mensajes encontrados de manera similar.
-     - **Parámetros Actualizados**: Parámetros derivados de respuestas API (ej: `api_{apiId}_data` o `api_{apiId}_error`) se fusionan con `currentParameters` de la sesión.
-     - La sesión (con `pendingApiResponses` y parámetros actualizados) se guarda antes de llamar a la IA si ha habido cambios por respuestas de API.
-     - El texto (potencialmente combinado con datos/errores de API) se envía a `aiService.getAIResponse`.
-     - El resto del flujo (validación de IA, llamada a FSM) continúa, pero la FSM ahora opera con parámetros que pueden haber sido enriquecidos o actualizados por respuestas de API.
-   - **`ensureStreamGroupExists(streamKey, groupName)`**: Nueva función helper para crear grupos de consumidores de Redis Stream si no existen (`XGROUP CREATE ... MKSTREAM`).
-   - **`main()`**: Asegura la conexión de ambos clientes Redis (main y subscriber) al inicio.
+### 6. `src/fsm.js` (`processInput` Refactorizado)
+   - **Fase 1: Inicialización y Determinación de Estado Objetivo para APIs Síncronas**:
+     - Carga sesión (que incluye `parameters`, `sync_api_results`, `pendingApiResponses`).
+     - Fusiona `inputParameters` (de la IA) con `sessionData.parameters`.
+     - Determina el `targetStateIdForSyncApis` (estado actual, o el siguiente si hay una transición por `intent` inmediata).
+   - **Fase 2: Ejecución de APIs Sincrónicas (`synchronousCallSetup`)**:
+     - Si `targetStateConfigForSyncApis.payloadResponse.apiHooks.synchronousCallSetup` existe:
+       - Para cada `apiId`: Llama `apiCallerService.makeRequestAndWait()`.
+       - Resultados (éxito o error estructurado) se guardan en `currentParameters.sync_api_results[apiId]`. `sessionData.parameters` se actualiza.
+       - Errores críticos aquí podrían llevar a un estado de error FSM.
+   - **Fase 3: Lógica de Transición FSM Principal**:
+     - Determina `nextStateId` final y `finalNextStateConfig` basado en `effectiveIntent` y `currentParameters` (que ahora incluyen `sync_api_results`).
+   - **Fase 4: Renderizado de `payloadResponse`**:
+     - El `payloadResponse` del `finalNextStateConfig` se renderiza usando `templateProcessor` con `currentParameters`. Plantillas aquí pueden acceder a `{{sync_api_results...}}`, `{{async_api_results...}}` (si `index.js` los puso en `currentParameters`), y parámetros normales.
+   - **Fase 5: Despacho de APIs Asíncronas (`asynchronousCallDispatch`)**:
+     - Si `finalNextStateConfig.payloadResponse.apiHooks.asynchronousCallDispatch` existe:
+       - Para cada `apiId`:
+         - Genera `correlationId` con `uuidv4()`.
+         - (Opcional: si `assignCorrelationIdTo` está en la definición, guarda el `correlationId` en `currentParameters`).
+         - Obtiene `response_stream_key_template` de la config de la API, la renderiza.
+         - Almacena `{ apiId, responseStreamKey, requestedAt }` en `sessionData.pendingApiResponses[correlationId]`.
+         - Llama a `apiCallerService.makeRequestAsync()` (fire-and-forget).
+   - **Guardado de Sesión**: `sessionData` (con todos los parámetros, `sync_api_results`, `pendingApiResponses` actualizados) se guarda en Redis.
+   - Devuelve la estructura de respuesta FSM.
 
-### 4. `src/logger.js`
-   - Sin cambios.
+### 7. `src/index.js` (`handleInputWithAI` Actualizado)
+   - **Manejo de Entrada**: Acepta texto o JSON `{ userInput, waitForCorrelationId, initialCall }`.
+   - **Carga de Sesión**: Llama `fsm.initializeOrRestoreSession()`. `currentParameters` se inicializa desde `sessionData.parameters`.
+   - **Procesamiento de Respuestas Asíncronas de Streams**:
+     - **Si `waitForCorrelationId`**: Llama a `processSingleAwaitedApiResponse()`:
+       - Hace `XREADGROUP ... BLOCK` en el stream de respuesta esperado (de `sessionData.pendingApiResponses`).
+       - Procesa el mensaje (éxito/error/timeout), lo añade a `fullTextInputForAI`, actualiza `currentParameters.async_api_results.{apiId}_data` o `_error`. Hace `XACK`. Elimina de `pendingApiResponses`.
+       - Si hay timeout del `BLOCK`, añade contexto de timeout a `fullTextInputForAI` y `currentParameters`.
+     - **Otras Respuestas Pendientes**: Llama a `checkNonAwaitedApiResponses()`:
+       - Itera `pendingApiResponses`, hace `XREADGROUP` con timeout corto en cada stream. Procesa, combina, ACKea y actualiza similarmente.
+   - **Guardado Intermedio de Sesión**: Si `pendingApiResponses` o `currentParameters` cambiaron debido a respuestas de streams, se guarda `sessionData`.
+   - **Llamada a IA**: `aiService.getAIResponse(fullTextInputForAI, aiPromptContent)`.
+   - **Validación de IA**.
+   - **Llamada Principal a FSM**: `fsm.processInput(sessionId, aiIntent, aiParametersFromAI, initialCallFlag)`.
+     - Nota: `fsm.processInput` recibe los `aiParameters` y los fusiona con los `currentParameters` de la sesión (que ya incluyen `async_api_results`). Luego `fsm.processInput` añade `sync_api_results`.
+   - Registra E/S en Redis. Devuelve resultado FSM.
 
-### 5. `src/aiService.js`
-   - Sin cambios funcionales mayores. Recibe el texto (potencialmente combinado) de `handleInputWithAI`.
+### 8. `config/aiPrompt.txt` (Actualizado)
+   - Incluye instrucciones para que la IA use:
+     - Datos de `customInstructions` que pueden contener `{{sync_api_results...}}` (ya renderizados cuando la IA los ve).
+     - Contexto de `[API Response Context ...]` o `[API Error Context ...]` para resultados de llamadas asíncronas de turnos anteriores.
 
-### 6. `src/jsonValidator.js`
-   - Sin cambios funcionales mayores.
-
-### 7. `src/apiConfigLoader.js` (NUEVO)
-   - **Propósito**: Cargar y gestionar las configuraciones de las API externas.
-   - **Funcionalidad**:
-     - Lee todos los archivos `.json` del directorio `config/api_definitions/`.
-     - Parsea cada archivo y lo almacena en un objeto caché, indexado por `apiId`.
-     - Proporciona `getApiConfigById(apiId)` para recuperar una configuración específica.
-     - Carga todas las configuraciones al iniciarse el módulo.
-
-### 8. `src/apiCallerService.js` (NUEVO)
-   - **Propósito**: Realizar las llamadas HTTP asíncronas a las APIs externas.
-   - **`makeRequest(apiId, sessionId, correlationId, collectedParameters)`**:
-     - Obtiene la configuración de la API usando `apiConfigLoader.getApiConfigById(apiId)`.
-     - Utiliza `templateProcessor.processTemplate` para renderizar placeholders en la URL, headers, `body_template` y `query_params_template` usando `collectedParameters` y otros datos de contexto (`sessionId`, `correlationId`).
-     - Realiza la llamada HTTP usando `axios` con el `method`, `url`, `headers`, `data` (cuerpo), `params` (query) y `timeout` configurados.
-     - **Importante**: Esta función es "fire-and-forget" desde la perspectiva de quien la llama (`fsm.js`). No espera la respuesta HTTP. Su rol es despachar la solicitud.
-     - Registra (log) el intento de despacho. El manejo de la respuesta real (éxito/error) y su publicación en el Redis Stream es responsabilidad de un "worker externo" (simulado por `scripts/simulateApiResponder.js`).
-
-### 9. `src/configLoader.js`
-   - Sin cambios funcionales mayores.
-
-### 10. `src/redisClient.js` (Actualizado)
-   - **Cliente Subscriber**: Se añade un `subscriberClient` separado para operaciones Redis bloqueantes (como `XREADGROUP ... BLOCK`) para no interferir con otras operaciones Redis no bloqueantes.
-   - **Nuevas Funciones para Streams**:
-     - `xadd(streamKey, id, ...fieldValuePairs)`: Para añadir mensajes a un stream.
-     - `xreadgroup(groupName, consumerName, streamsArray, blockMs, count)`: Para leer de un stream usando un grupo de consumidores.
-     - `xack(streamKey, groupName, ...messageIds)`: Para confirmar el procesamiento de mensajes.
-     - `xgroupCreate(streamKey, groupName, id, mkstream)`: Para crear un grupo de consumidores (y el stream si `mkstream` es true y no existe).
-   - `connect()` y `quit()` ahora manejan ambos clientes (main y subscriber).
-   - Lógica de reconexión y logging mejorada.
-
-### 11. `src/fsm.js` (Actualizado)
-   - **`initializeOrRestoreSession`**: Ahora inicializa `sessionData.pendingApiResponses = {}` si no existe.
-   - **`processInput()`**:
-     - Después de determinar `nextStateConfig` y `renderedPayloadResponse`:
-       - Busca la directiva `asyncApiCallsToTrigger` en `nextStateConfig.payloadResponse` (del config original, no del renderizado).
-       - Para cada API en `asyncApiCallsToTrigger`:
-         - Genera un `correlationId` único usando `uuidv4()`.
-         - Si `callDefinition.assignCorrelationIdTo` está definido, el `correlationId` se almacena en `currentParameters` (y por ende en `sessionData.parameters`).
-         - Renderiza los `params` de la API usando `templateProcessor` y `currentParameters`.
-         - Obtiene la configuración de la API (de `apiConfigLoader`) para encontrar el `response_stream_key_template`.
-         - Renderiza el `response_stream_key_template` usando `currentParameters`, `sessionId` y el `correlationId` generado.
-         - Almacena un objeto en `sessionData.pendingApiResponses[correlationId]` con `{ apiId, responseStreamKey, requestedAt }`.
-         - Llama a `apiCallerService.makeRequest(apiId, sessionId, correlationId, processedApiParams)` para despachar la llamada HTTP.
-     - La `sessionData` actualizada (incluyendo `pendingApiResponses` y cualquier `correlationId` añadido a `parameters`) se guarda en Redis.
-   - Referencias a `API_REQUEST_QUEUE_KEY` y `sendApiRequestAsync` eliminadas.
-
-### 12. `src/templateProcessor.js`
-    - Sin cambios funcionales mayores, pero su uso se extiende a las plantillas de definición de API.
-
-### 13. `scripts/simulateApiResponder.js` (Actualizado)
-    - Ya no sondea una lista de Redis.
-    - Ahora es una herramienta CLI que se ejecuta manualmente para simular la respuesta de una API específica.
-    - **Uso**: `node scripts/simulateApiResponder.js <responseStreamKey> <sessionId> <correlationId> <apiId> [status] [httpCode] [customDataJsonString]`
-    - Construye un mensaje JSON (conforme al formato definido en el Plan Paso 5: `correlationId`, `sessionId`, `apiId`, `status`, `httpCode`, `data`, `errorMessage`, `isTimeout`, `timestamp`).
-    - Usa `redisClient.xadd()` para añadir este mensaje al `responseStreamKey` especificado.
-    - Los valores del mensaje (ej: `data` o `errorMessage`) se generan según los argumentos `status`, `apiId` o el `customDataJsonString`.
-
-### 14. `.env.example` (Actualizado)
-    - **Nuevas Variables para Redis Streams**:
-        - `REDIS_STREAM_CONSUMER_GROUP`: Nombre del grupo de consumidores (ej: `fsm_ai_group`).
-        - `REDIS_STREAM_CONSUMER_NAME_PREFIX`: Prefijo para nombres de consumidor (ej: `fsm_consumer_`). Se le añade un UUID al inicio de la app.
-        - `REDIS_STREAM_XREAD_BLOCK_MS_PER_ITEM`: Timeout corto para lecturas no bloqueantes de streams en `checkForApiResponses`.
-        - `REDIS_STREAM_XREAD_BLOCK_WAIT_MS`: Timeout más largo para lecturas bloqueantes cuando `waitForCorrelationId` está presente.
-    - (Otras variables para IA, logging, etc., ya estaban presentes).
+### 9. `scripts/simulateApiResponder.js` (Actualizado)
+   - Herramienta CLI: `node scripts/simulateApiResponder.js <responseStreamKey> <sessionId> <correlationId> <apiId> [status] [httpCode] [customDataJsonString]`.
+   - Usa `redisClient.xadd()` para escribir un mensaje formateado (ver Plan Paso 5 para formato) al `responseStreamKey` especificado. Simula un worker externo que responde a una llamada API.
 
 ---
 *Fin del documento.*

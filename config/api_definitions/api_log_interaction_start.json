@@ -1,0 +1,17 @@
+{
+  "apiId": "api_log_interaction_start",
+  "description": "Logs the start of an interaction. (Fire and forget, typically no response needed by FSM).",
+  "url": "https://api.example.com/logs/interaction_start",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}"
+  },
+  "body_template": {
+    "sessionId": "{{sessionId}}",
+    "timestamp": "{{current_datetime}}",
+    "source": "{{source}}"
+  },
+  "timeout_ms": 1000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

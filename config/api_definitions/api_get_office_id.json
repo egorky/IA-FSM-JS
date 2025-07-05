@@ -1,0 +1,17 @@
+{
+  "apiId": "api_get_office_id",
+  "description": "Fetches office ID based on office name, specialty, and city.",
+  "url": "https://api.example.com/locations/offices",
+  "method": "GET",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}"
+  },
+  "query_params_template": {
+    "office_name_query": "{{preferred_office_name}}",
+    "city_id_filter": "{{sync_api_results.api_get_city_id.id}}",
+    "specialty_id_filter": "{{async_api_results.api_list_specialties.speciality_id}}"
+  },
+  "timeout_ms": 3000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

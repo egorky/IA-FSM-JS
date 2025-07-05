@@ -1,0 +1,16 @@
+{
+  "apiId": "api_get_city_id",
+  "description": "Fetches city ID based on city name.",
+  "url": "https://api.example.com/locations/cities",
+  "method": "GET",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}"
+  },
+  "query_params_template": {
+    "city_name_query": "{{city_name}}",
+    "country_code": "EC"
+  },
+  "timeout_ms": 2000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}

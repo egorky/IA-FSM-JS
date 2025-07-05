@@ -2,49 +2,25 @@
 const axios = require('axios');
 const logger = require('./logger');
 const { getApiConfigById } = require('./apiConfigLoader');
-const { processTemplate } = require('./templateProcessor'); // Assuming this can process simple objects/strings
-const redisClient = require('./redisClient'); // To write to Redis Stream (or a log for now)
-
-// This service INITIATES async calls.
-// A separate worker/process would listen for the actual 3rd party API responses
-// and then write them to the Redis Stream defined in `response_stream_key_template`.
+const { processTemplate } = require('./templateProcessor');
 
 /**
- * Makes an asynchronous HTTP request based on a loaded API configuration.
- * This function dispatches the request and logs its initiation. It does not await the HTTP response itself.
- * The actual response from the third-party API is expected to be written to a Redis Stream
- * by an external worker/process.
- *
- * @param {string} apiId - The ID of the API to call (from config/api_definitions).
- * @param {string} sessionId - The current session ID.
- * @param {string} correlationId - A unique ID to correlate this request with its eventual response.
- * @param {object} collectedParameters - Parameters collected so far in the FSM session, for templating.
- * @returns {Promise<boolean>} True if the request was successfully dispatched, false otherwise.
+ * Processes API call details (URL, headers, body, query_params) using templates.
  */
-async function makeRequest(apiId, sessionId, correlationId, collectedParameters) {
-  const apiConfig = getApiConfigById(apiId);
-
-  if (!apiConfig) {
-    logger.error({ apiId, sessionId, correlationId }, 'apiCallerService: API configuration not found.');
-    return false;
-  }
-
-  logger.info({ apiId, sessionId, correlationId, apiConfigUrl: apiConfig.url }, 'apiCallerService: Preparing to make request.');
-
-  // Prepare context for template processing, including sessionId and correlationId
+function prepareRequestConfig(apiConfig, sessionId, correlationId, collectedParameters) {
   const templateContext = {
     ...collectedParameters,
     sessionId,
     correlationId,
-    system_api_key: process.env.SYSTEM_WIDE_API_KEY || '' // Example of a system-level parameter
+    system_api_key: process.env.SYSTEM_WIDE_API_KEY || '', // Example system-level param
   };
 
   let url = apiConfig.url;
   try {
     url = processTemplate(apiConfig.url, templateContext);
   } catch (e) {
-    logger.error({ err: e, apiId, urlTemplate: apiConfig.url }, "apiCallerService: Error processing URL template.");
-    return false;
+    logger.error({ err: e, apiId: apiConfig.apiId, urlTemplate: apiConfig.url }, "apiCallerService: Error processing URL template.");
+    throw new Error(`URL template processing error for ${apiConfig.apiId}`);
   }
 
   const headers = {};
@@ -54,8 +30,8 @@ async function makeRequest(apiId, sessionId, correlationId, collectedParameters)
         headers[key] = processTemplate(apiConfig.headers[key], templateContext);
       }
     } catch (e) {
-      logger.error({ err: e, apiId, headerTemplate: apiConfig.headers }, "apiCallerService: Error processing headers template.");
-      return false;
+      logger.error({ err: e, apiId: apiConfig.apiId, headerTemplate: apiConfig.headers }, "apiCallerService: Error processing headers template.");
+      throw new Error(`Headers template processing error for ${apiConfig.apiId}`);
     }
   }
 
@@ -63,12 +39,10 @@ async function makeRequest(apiId, sessionId, correlationId, collectedParameters)
   if (apiConfig.method && ['POST', 'PUT', 'PATCH'].includes(apiConfig.method.toUpperCase())) {
     if (apiConfig.body_template) {
       try {
-        // processTemplate expects a string or a structure where strings will be processed.
-        // If body_template is an object, it should recursively process string values.
         body = processTemplate(JSON.parse(JSON.stringify(apiConfig.body_template)), templateContext);
       } catch (e) {
-        logger.error({ err: e, apiId, bodyTemplate: apiConfig.body_template }, "apiCallerService: Error processing body template.");
-        return false;
+        logger.error({ err: e, apiId: apiConfig.apiId, bodyTemplate: apiConfig.body_template }, "apiCallerService: Error processing body template.");
+        throw new Error(`Body template processing error for ${apiConfig.apiId}`);
       }
     }
   }
@@ -76,62 +50,110 @@ async function makeRequest(apiId, sessionId, correlationId, collectedParameters)
   let queryParams = null;
   if (apiConfig.method && apiConfig.method.toUpperCase() === 'GET' && apiConfig.query_params_template) {
     try {
-        queryParams = processTemplate(JSON.parse(JSON.stringify(apiConfig.query_params_template)), templateContext);
-        // Filter out any params that didn't resolve or are empty, if desired
-        queryParams = Object.entries(queryParams).reduce((acc, [key, value]) => {
-            if (value !== undefined && value !== null && value !== '') acc[key] = value;
-            return acc;
-        }, {});
+      queryParams = processTemplate(JSON.parse(JSON.stringify(apiConfig.query_params_template)), templateContext);
+      queryParams = Object.entries(queryParams).reduce((acc, [key, value]) => {
+        if (value !== undefined && value !== null && value !== '') acc[key] = value;
+        return acc;
+      }, {});
     } catch (e) {
-        logger.error({ err: e, apiId, queryParamsTemplate: apiConfig.query_params_template }, "apiCallerService: Error processing query_params template.");
-        return false;
+      logger.error({ err: e, apiId: apiConfig.apiId, queryParamsTemplate: apiConfig.query_params_template }, "apiCallerService: Error processing query_params template.");
+      throw new Error(`Query params template processing error for ${apiConfig.apiId}`);
     }
   }
 
-
-  const requestConfig = {
+  return {
     method: apiConfig.method,
     url: url,
     headers: headers,
     data: body,
-    params: queryParams, // Axios uses 'params' for URL query parameters
-    timeout: apiConfig.timeout_ms || 10000, // Default timeout if not specified
+    params: queryParams,
+    timeout: apiConfig.timeout_ms || parseInt(process.env.DEFAULT_API_TIMEOUT_MS, 10) || 10000,
   };
+}
 
-  logger.debug({ apiId, sessionId, correlationId, requestConfig: { ...requestConfig, data: body ? 'OMITTED_FOR_LOG' : null } }, 'apiCallerService: Dispatching HTTP request.');
+/**
+ * Makes an asynchronous HTTP request (fire-and-forget).
+ * The actual response from the third-party API is expected to be written to a Redis Stream
+ * by an external worker/process. This service only dispatches the call.
+ */
+async function makeRequestAsync(apiId, sessionId, correlationId, collectedParameters) {
+  const apiConfig = getApiConfigById(apiId);
+  if (!apiConfig) {
+    logger.error({ apiId, sessionId, correlationId }, 'apiCallerService.makeRequestAsync: API configuration not found.');
+    return false; // Or throw an error
+  }
 
-  // Fire and forget the actual HTTP call.
-  // The external API's response will be handled by another system/worker
-  // which will then publish a message to the appropriate Redis Stream.
-  axios(requestConfig)
-    .then(response => {
-      // This is where the EXTERNAL WORKER would pick up.
-      // For our app, we just log that the call was made. The worker is responsible for the stream write.
-      logger.info({ apiId, sessionId, correlationId, status: response.status }, 'apiCallerService: HTTP request dispatched successfully (actual response handling is external).');
-      // In a real scenario, the external worker would get response.data, response.status
-      // and write to the stream: apiConfig.response_stream_key_template (rendered)
-      // Example message to stream:
-      // { correlationId, status: "success", http_code: response.status, data: response.data, timestamp: new Date().toISOString() }
-    })
-    .catch(error => {
-      // This is also where the EXTERNAL WORKER would pick up an error.
-      logger.error({
-        err: error.message, // Log only message to avoid large objects if error.response is big
-        apiId,
-        sessionId,
-        correlationId,
-        isTimeout: error.code === 'ECONNABORTED',
-        responseData: error.response ? { status: error.response.status, data: error.response.data } : null
-      }, 'apiCallerService: HTTP request dispatch failed or resulted in error (actual error handling and stream write is external).');
-      // Example error message to stream:
-      // { correlationId, status: "error", http_code: error.response?.status, error_message: error.message, isTimeout: error.code === 'ECONNABORTED', timestamp: new Date().toISOString() }
-    });
+  logger.info({ apiId, sessionId, correlationId, url: apiConfig.url }, 'apiCallerService.makeRequestAsync: Preparing to dispatch.');
 
-  // We return true because the request dispatch process was initiated.
-  // The success/failure of the actual HTTP call is handled asynchronously and reported via Redis Stream by an external entity.
-  return true;
+  try {
+    const requestConfig = prepareRequestConfig(apiConfig, sessionId, correlationId, collectedParameters);
+    logger.debug({ apiId, sessionId, correlationId, requestConfig: { ...requestConfig, data: requestConfig.data ? 'OMITTED_FOR_LOG' : null } }, 'apiCallerService.makeRequestAsync: Dispatching HTTP request.');
+
+    // Fire and forget
+    axios(requestConfig)
+      .then(response => {
+        logger.info({ apiId, sessionId, correlationId, status: response.status }, 'apiCallerService.makeRequestAsync: HTTP request dispatched successfully (external worker handles response to stream).');
+        // External worker would now take response.data, response.status, etc.,
+        // and XADD to apiConfig.response_stream_key_template (rendered).
+      })
+      .catch(error => {
+        logger.error({
+          err: error.message, apiId, sessionId, correlationId,
+          isTimeout: error.code === 'ECONNABORTED',
+          responseData: error.response ? { status: error.response.status, data: error.response.data } : null
+        }, 'apiCallerService.makeRequestAsync: HTTP request dispatch failed or resulted in error (external worker handles error reporting to stream).');
+      });
+    return true; // Dispatch initiated
+  } catch (processingError) {
+    // Error during request config preparation
+    logger.error({ err: processingError, apiId, sessionId, correlationId }, 'apiCallerService.makeRequestAsync: Failed to prepare request config.');
+    return false;
+  }
+}
+
+/**
+ * Makes a synchronous HTTP request and waits for the response or timeout.
+ * Returns a structured response/error object.
+ */
+async function makeRequestAndWait(apiId, sessionId, correlationId, collectedParameters) {
+  const apiConfig = getApiConfigById(apiId);
+  if (!apiConfig) {
+    logger.error({ apiId, sessionId, correlationId }, 'apiCallerService.makeRequestAndWait: API configuration not found.');
+    return { status: 'error', errorMessage: 'API configuration not found', httpCode: null, isTimeout: false, data: null };
+  }
+
+  logger.info({ apiId, sessionId, correlationId, url: apiConfig.url }, 'apiCallerService.makeRequestAndWait: Preparing and making synchronous request.');
+
+  try {
+    const requestConfig = prepareRequestConfig(apiConfig, sessionId, correlationId, collectedParameters);
+    logger.debug({ apiId, sessionId, correlationId, requestConfig: { ...requestConfig, data: requestConfig.data ? 'OMITTED_FOR_LOG' : null } }, 'apiCallerService.makeRequestAndWait: Executing HTTP request.');
+
+    const response = await axios(requestConfig);
+    logger.info({ apiId, sessionId, correlationId, status: response.status }, 'apiCallerService.makeRequestAndWait: Synchronous HTTP request successful.');
+    return {
+      status: 'success',
+      httpCode: response.status,
+      data: response.data,
+      errorMessage: null,
+      isTimeout: false,
+    };
+  } catch (error) {
+    const isTimeout = error.code === 'ECONNABORTED';
+    logger.error({
+      err: error.message, apiId, sessionId, correlationId, isTimeout,
+      responseData: error.response ? { status: error.response.status, data: error.response.data } : null
+    }, 'apiCallerService.makeRequestAndWait: Synchronous HTTP request failed or timed out.');
+    return {
+      status: 'error',
+      httpCode: error.response?.status || null,
+      data: error.response?.data || null,
+      errorMessage: error.message,
+      isTimeout: isTimeout,
+    };
+  }
 }
 
 module.exports = {
-  makeRequest,
+  makeRequestAsync,     // For fire-and-forget calls (responses via Redis Stream)
+  makeRequestAndWait, // For calls where the FSM needs the response in the same turn
 };

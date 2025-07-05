@@ -1,0 +1,16 @@
+{
+  "apiId": "api_list_specialties",
+  "description": "Fetches a list of available medical specialties, possibly filtered by city ID.",
+  "url": "https://api.example.com/medical/specialties",
+  "method": "GET",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Auth-Token": "{{system_api_key}}"
+  },
+  "query_params_template": {
+    "city_id_filter": "{{sync_api_results.api_get_city_id.id}}",
+    "active_only": "true"
+  },
+  "timeout_ms": 4000,
+  "response_stream_key_template": "api_responses_stream:{{sessionId}}:{{correlationId}}"
+}
