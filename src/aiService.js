@@ -96,19 +96,39 @@ async function getGoogleGeminiResponse(textInput, prompt) {
     // Based on some SDK examples, `response.text` might still be the way, or it might be nested.
     // Let's assume response.text() is the primary way as per documentation for schema usage.
     // If the API directly returns a JSON object in a specific field when schema is used, that would be better.
-    // For now, we rely on response.text() and then JSON.parse.
-    const responseText = response.text();
-
-    if (!responseText) {
-      throw new Error('Google Gemini response text is empty, even with responseSchema.');
+    // The generateContent directly returns the GenerateContentResponse object.
+    // Accessing the content when responseSchema is used:
+    let responseText = '';
+    // The actual response object from generateContent is the result itself, not a nested .response
+    if (response.candidates &&
+        response.candidates.length > 0 &&
+        response.candidates[0].content &&
+        response.candidates[0].content.parts &&
+        response.candidates[0].content.parts.length > 0 &&
+        typeof response.candidates[0].content.parts[0].text === 'string' // Ensure text exists and is a string
+    ) {
+      responseText = response.candidates[0].content.parts[0].text;
+    } else {
+      logger.warn({responseObj: JSON.stringify(response, null, 2)}, "Unexpected Gemini response structure or empty text part when extracting text with responseSchema.");
+      // If the primary path fails, we might not have a useful responseText.
+      // Avoid calling .text() if it's not a function, which was the previous error.
+      if (response && typeof response.text === 'function') { // Check if .text() method exists (it was causing error)
+          // This path is unlikely to be hit if the above structure is the norm for schema responses,
+          // but as a very defensive fallback.
+          logger.warn("Attempting to call response.text() as a last resort for Gemini.");
+          responseText = response.text(); // This was the line causing the previous error.
+      }
+      if (!responseText) { // If still no text
+        throw new Error('Google Gemini response content is empty or in an unexpected format after attempting extraction.');
+      }
     }
 
     await logToRedis(`ai_output:google:${Date.now()}`, { response: responseText });
-    const parsedResponse = JSON.parse(responseText);
+    const parsedResponse = JSON.parse(responseText); // This assumes responseText is the stringified top-level JSON
 
     // Now, parse the parameters_json_string
     let finalParameters = {};
-    if (parsedResponse.parameters_json_string) {
+    if (parsedResponse && parsedResponse.parameters_json_string) {
       try {
         finalParameters = JSON.parse(parsedResponse.parameters_json_string);
       } catch (e) {
@@ -116,6 +136,8 @@ async function getGoogleGeminiResponse(textInput, prompt) {
           "Failed to parse parameters_json_string from Gemini response. Defaulting to empty parameters object.");
         // Keep finalParameters as {}
       }
+    } else {
+        logger.warn({parsedResponseFromAI: parsedResponse},"Gemini response missing 'parameters_json_string' field.");
     }
     return { intent: parsedResponse.intent, parameters: finalParameters };
 
