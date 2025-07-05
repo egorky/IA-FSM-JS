@@ -1,6 +1,6 @@
 // src/aiService.js
 const OpenAI = require('openai');
-const { GoogleGenerativeAI } = require('@google/genai');
+const { GoogleGenAI } = require('@google/genai'); // Corrected import name
 const Groq = require('groq-sdk');
 const redisClient = require('./redisClient');
 const logger = require('./logger'); // Assuming pino logger is set up in logger.js
@@ -17,7 +17,7 @@ let openai, genAI, groq;
 if (AI_PROVIDER === 'openai' && OPENAI_API_KEY) {
   openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 } else if (AI_PROVIDER === 'google' && GEMINI_API_KEY) {
-  genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  genAI = new GoogleGenAI({apiKey: GEMINI_API_KEY}); // Corrected instantiation
 } else if (AI_PROVIDER === 'groq' && GROQ_API_KEY) {
   groq = new Groq({ apiKey: GROQ_API_KEY });
 }
