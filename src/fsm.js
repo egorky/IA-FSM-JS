@@ -368,6 +368,20 @@ async function processInput(sessionId, intent, inputParameters = {}, initialCall
     let finalNextStateId = candidateNextStateId;
     let finalNextStateConfig = candidateNextStateConfig;
 
+    // --- Ejecutar Acciones Asíncronas del Estado de Origen SI HAY TRANSICIÓN ---
+    if (currentSessionStateId !== finalNextStateId && fsmCurrentStateConfigAtStart.payloadResponse?.apiHooks?.asynchronousCallDispatch) {
+        logger.info({sessionId, state: fsmCurrentStateConfigAtStart.id, type: 'ORIGIN_STATE_ON_TRANSITION'}, "Executing asynchronousCallDispatch APIs for origin state due to transition.");
+        await executeApiHook(
+            'asynchronousCallDispatch',
+            fsmCurrentStateConfigAtStart.payloadResponse.apiHooks.asynchronousCallDispatch,
+            currentParameters,
+            sessionId,
+            sessionData
+        );
+        // Considerar si los scripts asíncronos del estado de origen también deben correr aquí.
+        // Por ahora, nos enfocamos en asynchronousCallDispatch según el problema reportado.
+    }
+
     if (currentSessionStateId !== finalNextStateId) {
         logger.info({ sessionId, fromState: currentSessionStateId, toState: finalNextStateId }, `FSM transitioning`);
         sessionData.currentStateId = finalNextStateId;
