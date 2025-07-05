@@ -1,19 +1,20 @@
-const { getStateById, getInitialStateId } = require('./configLoader');
+const { getStateById, getInitialStateId, getAllStates: getAllStatesConfig } = require('./configLoader');
 const redisClient = require('./redisClient');
 const { processTemplate } = require('./templateProcessor');
 const logger = require('./logger');
 const { v4: uuidv4 } = require('uuid');
 const apiCallerService = require('./apiCallerService');
 const { getApiConfigById } = require('./apiConfigLoader');
+const scriptExecutor = require('./scriptExecutor'); // Nuevo import
 
 const FSM_SESSION_PREFIX = 'fsm_session:';
 
 function saveSessionAsync(sessionKey, sessionData, sessionTTL) {
   const jsonData = JSON.stringify(sessionData);
-  let promise = redisClient.set(sessionKey, jsonData); // Default no TTL
-  if (sessionTTL && sessionTTL > 0) {
-    promise = redisClient.set(sessionKey, jsonData, 'EX', sessionTTL);
-  }
+  // Default TTL from env var if not provided or invalid in call
+  const effectiveTTL = (sessionTTL && sessionTTL > 0) ? sessionTTL : (parseInt(process.env.REDIS_SESSION_TTL, 10) || 3600);
+
+  let promise = redisClient.set(sessionKey, jsonData, 'EX', effectiveTTL);
   promise.catch(err => {
     logger.error({ err, sessionId: sessionKey.split(':')[1] }, 'FSM session failed to save to Redis.');
   });
@@ -25,8 +26,9 @@ async function initializeOrRestoreSession(sessionId) {
   if (sessionDataString) {
     const session = JSON.parse(sessionDataString);
     session.pendingApiResponses = session.pendingApiResponses || {};
-    session.sync_api_results = session.sync_api_results || {}; // Initialize if not present
+    session.sync_api_results = session.sync_api_results || {};
     session.parameters = session.parameters || {};
+    session.conversationHistory = session.conversationHistory || []; // Initialize conversationHistory
     logger.debug({ sessionId }, 'FSM session restored from Redis.');
     return session;
   } else {
@@ -34,241 +36,390 @@ async function initializeOrRestoreSession(sessionId) {
     const initialSession = {
       currentStateId: initialStateId,
       parameters: {},
-      history: [initialStateId],
+      history: [initialStateId], // History of states visited
+      conversationHistory: [], // History of user:AI interactions
       pendingApiResponses: {},
-      sync_api_results: {}, // Initialize for new sessions
+      sync_api_results: {},
     };
-    const sessionTTL = parseInt(process.env.REDIS_SESSION_TTL, 10);
-    saveSessionAsync(sessionKey, initialSession, sessionTTL);
+    // saveSessionAsync will use default TTL from env if not passed here
+    saveSessionAsync(sessionKey, initialSession);
     logger.info({ sessionId, initialStateId }, 'FSM new session initialized.');
     return initialSession;
   }
 }
 
-async function processInput(sessionId, intent, inputParameters = {}, initialCall = false) {
-  const sessionKey = `${FSM_SESSION_PREFIX}${sessionId}`;
-  let sessionData = await initializeOrRestoreSession(sessionId);
-  let currentStateId = sessionData.currentStateId;
+function areDependenciesMet(dependsOn, currentParameters, sessionId) {
+  if (!dependsOn) return true; // No dependencies defined
 
-  // Merge incoming parameters and ensure session.parameters is the single source of truth for currentParameters
-  let currentParameters = { ...sessionData.parameters, ...inputParameters };
-  sessionData.parameters = currentParameters; // Update sessionData's parameters
-
-  if (!sessionData.sync_api_results) sessionData.sync_api_results = {};
-  if (!sessionData.pendingApiResponses) sessionData.pendingApiResponses = {};
-
-  let effectiveIntent = intent;
-  if (!initialCall && !effectiveIntent && process.env.DEFAULT_INTENT) { // Avoid default intent on very first call if not desired
-    effectiveIntent = process.env.DEFAULT_INTENT;
-    logger.info({ sessionId, defaultIntent: effectiveIntent }, `FSM: No intent. Using DEFAULT_INTENT.`);
-  }
-
-  logger.debug({ sessionId, currentStateId, intent: effectiveIntent, inputParametersCount: Object.keys(inputParameters).length }, 'FSM processing input: Start');
-
-  // --- Phase 1: Determine Target State (current or next based on transitions) ---
-  // This logic determines the state whose 'synchronousCallSetup' should be processed.
-  // If there's an intent, we first see if it causes an immediate transition.
-  // If so, the target state for syncAPIs is the new state. Otherwise, it's the current state.
-
-  let preliminaryNextStateId = null;
-  let preliminaryMatchedTransition = false;
-  const fsmCurrentStateConfig = getStateById(currentStateId); // Config of the state *before* transitions for this input
-
-  if (effectiveIntent && fsmCurrentStateConfig.transitions && fsmCurrentStateConfig.transitions.length > 0) {
-    for (const transition of fsmCurrentStateConfig.transitions) {
-      if (transition.condition && transition.condition.intent === effectiveIntent) {
-        preliminaryNextStateId = transition.nextState;
-        preliminaryMatchedTransition = true;
-        break;
-      }
-    }
-  }
-  // Parameter-based transitions are typically evaluated *after* parameters for the current state are collected
-  // and after synchronous APIs for the current state might have run.
-  // For now, we'll assume synchronous APIs are primarily for the *current state* before parameter collection prompts,
-  // or for the *target state* if an intent causes an immediate transition.
-
-  const targetStateIdForSyncApis = preliminaryNextStateId || currentStateId;
-  const targetStateConfigForSyncApis = getStateById(targetStateIdForSyncApis);
-
-  if (!targetStateConfigForSyncApis) {
-    logger.error({ targetStateIdForSyncApis, sessionId }, 'FSM Error: Config for target state (for sync APIs) not found.');
-    throw new Error(`Config for target state ${targetStateIdForSyncApis} not found.`);
-  }
-
-  // --- Phase 2: Execute Synchronous API Calls (`synchronousCallSetup`) for the target state ---
-  const syncCallsDefinition = targetStateConfigForSyncApis.payloadResponse?.apiHooks?.synchronousCallSetup;
-  if (syncCallsDefinition && Array.isArray(syncCallsDefinition)) {
-    logger.info({sessionId, state: targetStateIdForSyncApis, apis: syncCallsDefinition}, "Executing synchronousCallSetup APIs");
-    for (const apiId of syncCallsDefinition) {
-      const correlationId = `sync_${apiId}_${Date.now()}`; // Simpler correlation for sync calls
-      const apiResponse = await apiCallerService.makeRequestAndWait(apiId, sessionId, correlationId, currentParameters);
-
-      // Namespace results to avoid collision and for clarity in templates
-      currentParameters.sync_api_results = currentParameters.sync_api_results || {};
-      currentParameters.sync_api_results[apiId] = apiResponse; // Store full response (status, data, error)
-      sessionData.parameters = currentParameters; // Update session parameters immediately
-
-      if (apiResponse.status === 'error') {
-        logger.warn({ sessionId, apiId, error: apiResponse.errorMessage }, 'Synchronous API call failed.');
-        // Potentially transition to a specific error state or add error flags for AI/templating
-        // For now, the error is in sync_api_results and can be checked by templates/AI
+  if (dependsOn.parameters) {
+    for (const param of dependsOn.parameters) {
+      if (!currentParameters.hasOwnProperty(param) || currentParameters[param] === null || currentParameters[param] === '') {
+        logger.debug({ sessionId, missingParam: param, check: 'dependency' }, 'Dependency not met: missing parameter');
+        return false;
       }
     }
   }
 
-  // --- Phase 3: FSM Transition Logic (Now with potentially updated currentParameters from sync APIs) ---
-  // This is the main transition logic based on intent and allParametersMet for the *original* currentStateId
-  // Or, if a preliminaryNextStateId was determined by intent, that becomes the new currentStateId.
-
-  let nextStateId = currentStateId; // Start with current state
-  let finalNextStateConfig = fsmCurrentStateConfig; // And its config
-
-  if (preliminaryNextStateId) { // Intent-based transition already determined
-      nextStateId = preliminaryNextStateId;
-      finalNextStateConfig = getStateById(nextStateId);
-      if (!finalNextStateConfig) {
-          logger.error({ nextStateId, sessionId }, 'FSM Error: Config for intent-based next state not found.');
-          throw new Error(`Config for next state ${nextStateId} not found.`);
+  if (dependsOn.apiResults) {
+    for (const apiDep of dependsOn.apiResults) {
+      const apiResult = currentParameters.sync_api_results?.[apiDep.apiId] || currentParameters.async_api_results?.[apiDep.apiId];
+      if (!apiResult) {
+        logger.debug({ sessionId, missingApiResult: apiDep.apiId, check: 'dependency' }, 'Dependency not met: missing API result');
+        return false;
       }
-      logger.debug({ sessionId, transitionTo: nextStateId, reason: `Intent match: ${effectiveIntent}` }, 'FSM transition by intent confirmed');
-  } else { // No intent-based transition, evaluate parameter-based transitions for fsmCurrentStateConfig
-      let parameterTransitionFound = false;
-      if (fsmCurrentStateConfig.transitions && fsmCurrentStateConfig.transitions.length > 0) {
-          for (const transition of fsmCurrentStateConfig.transitions) {
-              if (transition.condition && !transition.condition.intent) {
-                  if (typeof transition.condition.allParametersMet === 'undefined' || transition.condition.allParametersMet) {
-                      const requiredParams = fsmCurrentStateConfig.parameters?.required || [];
-                      const allRequiredMet = requiredParams.every(param => currentParameters.hasOwnProperty(param) && currentParameters[param] !== null && currentParameters[param] !== '');
-                      if (allRequiredMet) {
-                          nextStateId = transition.nextState;
-                          parameterTransitionFound = true;
-                          logger.debug({ sessionId, transitionTo: nextStateId, reason: 'All params met for current state' }, 'FSM transition by params');
-                          break;
-                      }
-                  } else if (transition.condition.allParametersMet === false) {
-                      nextStateId = transition.nextState;
-                      parameterTransitionFound = true;
-                      logger.debug({ sessionId, transitionTo: nextStateId, reason: 'Condition allParametersMet: false for current state' }, 'FSM transition by allParametersMet:false');
-                      break;
-                  }
-              }
-          }
+      if (apiDep.status && apiResult.status !== apiDep.status) {
+        logger.debug({ sessionId, apiId: apiDep.apiId, expectedStatus: apiDep.status, actualStatus: apiResult.status, check: 'dependency' }, 'Dependency not met: API result status mismatch');
+        return false;
       }
-      if (!parameterTransitionFound && fsmCurrentStateConfig.defaultNextState) {
-          const requiredParams = fsmCurrentStateConfig.parameters?.required || [];
-          const allRequiredMet = requiredParams.every(param => currentParameters.hasOwnProperty(param) && currentParameters[param] !== null && currentParameters[param] !== '');
-          if (allRequiredMet) {
-              nextStateId = fsmCurrentStateConfig.defaultNextState;
-              logger.debug({ sessionId, transitionTo: nextStateId, reason: 'Default next state for current state, all params met' }, 'FSM transition by defaultNextState');
-          }
-      }
-      // If nextStateId changed, update finalNextStateConfig
-      if (nextStateId !== currentStateId) {
-          finalNextStateConfig = getStateById(nextStateId);
-          if (!finalNextStateConfig) {
-              logger.error({ nextStateId, sessionId }, 'FSM Error: Config for parameter-based next state not found.');
-              throw new Error(`Config for next state ${nextStateId} not found.`);
-          }
-      }
-  }
-
-  if (currentStateId !== nextStateId) {
-    logger.info({ sessionId, fromState: currentStateId, toState: nextStateId }, `FSM transitioning`);
-    sessionData.currentStateId = nextStateId;
-    if (!sessionData.history.length || sessionData.history[sessionData.history.length - 1] !== nextStateId) {
-      sessionData.history.push(nextStateId);
-    }
-  } else {
-    logger.debug({ sessionId, state: currentStateId }, 'FSM staying in current state');
-  }
-  // sessionData.parameters is already currentParameters
-
-  // --- Phase 4: Render PayloadResponse for the *final* next state ---
-  let renderedPayloadResponse = {};
-  if (finalNextStateConfig.payloadResponse) {
-    try {
-      // currentParameters now includes results from synchronousCallSetup
-      renderedPayloadResponse = processTemplate(
-        JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse)),
-        currentParameters
-      );
-    } catch (templateError) {
-      logger.error({ err: templateError, sessionId, state: nextStateId }, `FSM Error: Processing payloadResponse template for state.`);
-      renderedPayloadResponse = JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse)); // Fallback
     }
   }
+  return true;
+}
 
-  // --- Phase 5: Initiate Asynchronous API Calls (`asynchronousCallDispatch`) for the *final* next state ---
-  // These are based on the state we are *now in* or *transitioning to definitively*.
-  // The `apiHooks` should be read from the *original* config, not the rendered one.
-  const asyncCallsDispatch = finalNextStateConfig.payloadResponse?.apiHooks?.asynchronousCallDispatch;
-  if (asyncCallsDispatch && Array.isArray(asyncCallsDispatch)) {
-    logger.info({sessionId, state: nextStateId, apis: asyncCallsDispatch}, "Initiating asynchronousCallDispatch APIs");
-    for (const apiId of asyncCallsDispatch) { // Assuming this is just an array of apiIds
-      const callDefinition = { apiId: apiId }; // Minimal definition if only apiId is provided
-      // If `asyncApiCallsToTrigger` structure was intended here, this loop needs adjustment
-      // For now, let's assume `asynchronousCallDispatch` contains objects like `asyncApiCallsToTrigger` items.
-      // The user's states.json uses simple strings, so we adapt:
+async function executeApiHook(hookType, hookConfigArray, currentParameters, sessionId, sessionData) {
+    if (!hookConfigArray || !Array.isArray(hookConfigArray)) return;
 
-      const correlationId = uuidv4(); // Always generate new for async
+    logger.info({ sessionId, hookType, count: hookConfigArray.length }, `Executing API hook: ${hookType}`);
 
-      // If 'assignCorrelationIdTo' was part of a richer object structure for these calls:
-      // if (callDefinition.assignCorrelationIdTo) {
-      //   currentParameters[callDefinition.assignCorrelationIdTo] = correlationId;
-      //   sessionData.parameters[callDefinition.assignCorrelationIdTo] = correlationId;
-      // }
+    for (const apiCallDefinition of hookConfigArray) {
+        // Adapt to states.json where apiHooks might contain simple strings (apiId) or objects
+        let apiId;
+        let dependsOn = null;
 
-      let processedApiParams = {}; // Params for async calls might be defined differently or use currentParameters
-      // if (callDefinition.params) {
-      //   processedApiParams = processTemplate(JSON.parse(JSON.stringify(callDefinition.params)), currentParameters);
-      // }
+        if (typeof apiCallDefinition === 'string') {
+            apiId = apiCallDefinition;
+            // No dependencies if it's just a string
+        } else if (typeof apiCallDefinition === 'object' && apiCallDefinition !== null && apiCallDefinition.apiId) {
+            apiId = apiCallDefinition.apiId;
+            dependsOn = apiCallDefinition.dependsOn;
+        } else {
+            logger.warn({sessionId, apiCallDefinition, hookType}, "API call in hook is malformed (not string or object with apiId). Skipping.");
+            continue;
+        }
 
-      const apiConfig = getApiConfigById(apiId); // apiId directly from the array
-      if (!apiConfig || !apiConfig.response_stream_key_template) {
-        logger.error({ apiId, sessionId }, `FSM: Missing apiConfig or response_stream_key_template for async call. Skipping.`);
-        continue;
-      }
+        if (areDependenciesMet(dependsOn, currentParameters, sessionId)) {
+            logger.info({ sessionId, apiId: apiId, hookType }, `Dependencies met for API, proceeding.`);
+            if (hookType === 'synchronousCallSetup') {
+                const correlationId = `sync_${apiId}_${Date.now()}`;
+                const apiResponse = await apiCallerService.makeRequestAndWait(apiId, sessionId, correlationId, currentParameters);
+                currentParameters.sync_api_results = currentParameters.sync_api_results || {};
+                currentParameters.sync_api_results[apiId] = apiResponse;
+                // sessionData.parameters is a reference to currentParameters, so it's updated.
 
-      const templateContextForStreamKey = { ...currentParameters, correlationId, sessionId };
-      const responseStreamKey = processTemplate(apiConfig.response_stream_key_template, templateContextForStreamKey);
+                if (apiResponse.status === 'error') {
+                    logger.warn({ sessionId, apiId: apiId, error: apiResponse.errorMessage }, 'Synchronous API call from hook failed.');
+                }
+            } else if (hookType === 'asynchronousCallDispatch') {
+                const correlationId = uuidv4();
+                const apiConfig = getApiConfigById(apiId);
+                if (!apiConfig || !apiConfig.response_stream_key_template) {
+                    logger.error({ apiId: apiId, sessionId }, `FSM: Missing apiConfig or response_stream_key_template for async call in hook. Skipping.`);
+                    continue;
+                }
+                const templateContextForStreamKey = { ...currentParameters, correlationId, sessionId };
+                const responseStreamKey = processTemplate(apiConfig.response_stream_key_template, templateContextForStreamKey);
 
-      sessionData.pendingApiResponses[correlationId] = {
-        apiId: apiId,
-        responseStreamKey: responseStreamKey,
-        requestedAt: new Date().toISOString(),
-      };
-      logger.info({sessionId, correlationId, apiId, responseStreamKey}, "FSM: Marked async API call as pending.");
-
-      apiCallerService.makeRequestAsync(apiId, sessionId, correlationId, processedApiParams);
+                sessionData.pendingApiResponses[correlationId] = {
+                    apiId: apiId,
+                    responseStreamKey: responseStreamKey,
+                    requestedAt: new Date().toISOString(),
+                };
+                apiCallerService.makeRequestAsync(apiId, sessionId, correlationId, currentParameters);
+                logger.info({sessionId, correlationId, apiId: apiId, responseStreamKey}, "FSM: Marked async API call from hook as pending.");
+            }
+        } else {
+            logger.info({ sessionId, apiId: apiId, hookType, dependencies: dependsOn }, `Dependencies NOT MET for API, skipping.`);
+        }
     }
-  }
+}
 
-  const requiredForNext = finalNextStateConfig.parameters?.required || [];
-  const optionalForNext = finalNextStateConfig.parameters?.optional || [];
-  const parametersToCollect = {
-    required: requiredForNext.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === ''),
-    optional: optionalForNext.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === '')
-  };
+function getSkippedStates(currentInternalStateId, targetInternalStateId, allStatesMap) {
+    const skippedStateConfigs = [];
+    const path = []; // To store the sequence of state IDs in the path
 
-  const sessionTTL = parseInt(process.env.REDIS_SESSION_TTL, 10);
-  saveSessionAsync(sessionKey, sessionData, sessionTTL);
+    if (currentInternalStateId === targetInternalStateId) {
+        return [];
+    }
 
-  logger.debug({ sessionId, finalState: nextStateId, paramsToCollectCount: parametersToCollect.required.length }, 'FSM processing complete.');
+    // Attempt to find a path using a simple BFS-like approach on transitions.
+    // This assumes states are somewhat connected and doesn't handle complex graphs perfectly
+    // but is better than just numeric comparison for many FSMs.
+    const queue = [[currentInternalStateId, [currentInternalStateId]]]; // [currentStateId, currentPathToIt]
+    const visitedForPathFinding = new Set([currentInternalStateId]);
+    let foundPath = null;
 
-  return {
-    nextStateId: nextStateId, // The state ID FSM has decided upon
-    currentStateConfig: fsmCurrentStateConfig, // Config of state at start of this processInput
-    nextStateConfig: finalNextStateConfig, // Config of the state FSM is now in
-    parametersToCollect: parametersToCollect,
-    payloadResponse: renderedPayloadResponse,
-    sessionData: sessionData, // Contains updated .parameters, .pendingApiResponses, .sync_api_results
-  };
+    while (queue.length > 0) {
+        const [currId, currentPathArr] = queue.shift();
+
+        if (currId === targetInternalStateId) {
+            foundPath = currentPathArr;
+            break;
+        }
+
+        const currConfig = allStatesMap[currId];
+        if (!currConfig) continue;
+
+        const nextPossibleStates = [];
+        if (currConfig.transitions) {
+            currConfig.transitions.forEach(t => nextPossibleStates.push(t.nextState));
+        }
+        if (currConfig.defaultNextState) {
+            nextPossibleStates.push(currConfig.defaultNextState);
+        }
+
+        for (const nextId of nextPossibleStates) {
+            if (nextId && !visitedForPathFinding.has(nextId)) {
+                visitedForPathFinding.add(nextId);
+                const newPath = [...currentPathArr, nextId];
+                if (nextId === targetInternalStateId) {
+                    foundPath = newPath;
+                    break;
+                }
+                queue.push([nextId, newPath]);
+            }
+        }
+        if (foundPath) break;
+    }
+
+    if (foundPath && foundPath.length > 2) { // Path includes start, intermediate(s), end
+        // Skipped states are all states in the path except start (current) and end (target)
+        for (let i = 1; i < foundPath.length - 1; i++) {
+            const skippedId = foundPath[i];
+            if (allStatesMap[skippedId]) {
+                skippedStateConfigs.push(allStatesMap[skippedId]);
+            }
+        }
+        logger.info({sessionId: null, from:currentInternalStateId, to:targetInternalStateId, path: foundPath, skipped: skippedStateConfigs.map(s=>s.id)}, "Path found, identified skipped states.");
+    } else if (foundPath && foundPath.length <=2){
+         logger.debug({sessionId: null, from:currentInternalStateId, to:targetInternalStateId, path: foundPath}, "Direct transition or no intermediate states in path, no states considered skipped.");
+    } else {
+        // Fallback to numeric prefix logic if no path found via transitions, as a last resort (with warnings)
+        logger.warn({currentInternalStateId, targetInternalStateId}, "Could not determine path via transitions for skipped states. Falling back to numeric prefix logic. This is unreliable.");
+        const getNumericPrefix = (stateId) => {
+            if (!stateId || typeof stateId !== 'string') return NaN;
+            const parts = stateId.split('_');
+            const num = parseInt(parts[0], 10);
+            return isNaN(num) ? NaN : num;
+        };
+
+        const currentNum = getNumericPrefix(currentInternalStateId);
+        const targetNum = getNumericPrefix(targetInternalStateId);
+
+        if (!isNaN(currentNum) && !isNaN(targetNum) && targetNum > currentNum + 1) {
+            for (let i = currentNum + 1; i < targetNum; i++) {
+                for (const stateIdKey in allStatesMap) {
+                    if (getNumericPrefix(stateIdKey) === i) {
+                        logger.debug({foundSkipped: allStatesMap[stateIdKey].id}, "Found potential skipped state by numeric prefix (fallback).");
+                        skippedStateConfigs.push(allStatesMap[stateIdKey]);
+                        break;
+                    }
+                }
+            }
+        } else {
+            logger.debug({currentInternalStateId, targetInternalStateId, currentNum, targetNum}, "No skipped states identified by numeric prefix logic (fallback) or target is not numerically after current + 1.");
+        }
+    }
+
+    if (skippedStateConfigs.length > 0) {
+        logger.info({skipped: skippedStateConfigs.map(s=>s.id)}, "Identified skipped states to process.")
+    }
+    return skippedStateConfigs;
+}
+
+async function executeScriptHook(scriptHookConfigArray, currentParameters, sessionId, sessionData) {
+    if (!scriptHookConfigArray || !Array.isArray(scriptHookConfigArray)) return;
+
+    logger.info({ sessionId, hookType: 'executeScript', count: scriptHookConfigArray.length }, 'Executing script hook.');
+
+    for (const scriptDefinition of scriptHookConfigArray) {
+        if (!scriptDefinition.scriptId || (!scriptDefinition.filePath && !scriptDefinition.scriptId) || !scriptDefinition.functionName) {
+            logger.warn({sessionId, scriptDefinition}, "Script definition is malformed (missing scriptId/filePath or functionName). Skipping.");
+            continue;
+        }
+
+        if (areDependenciesMet(scriptDefinition.dependsOn, currentParameters, sessionId)) {
+            logger.info({ sessionId, scriptId: scriptDefinition.scriptId, functionName: scriptDefinition.functionName }, `Dependencies met for script, proceeding.`);
+
+            const executionResult = await scriptExecutor.executeScript(scriptDefinition, currentParameters, sessionId);
+
+            if (executionResult.error) {
+                logger.warn({ sessionId, scriptId: scriptDefinition.scriptId, error: executionResult.error }, 'Script execution failed.');
+                // Optionally store error in a designated place in currentParameters
+                // currentParameters.script_errors = currentParameters.script_errors || {};
+                // currentParameters.script_errors[scriptDefinition.scriptId || scriptDefinition.filePath] = executionResult.error;
+            } else if (scriptDefinition.assignResultTo && typeof executionResult.result !== 'undefined') {
+                currentParameters[scriptDefinition.assignResultTo] = executionResult.result;
+                logger.info({sessionId, scriptId: scriptDefinition.scriptId, assignResultTo: scriptDefinition.assignResultTo, value: executionResult.result}, "Script result assigned to currentParameters.")
+            } else if (typeof executionResult.result !== 'undefined') {
+                // Default namespace if assignResultTo is not specified but there's a result
+                currentParameters.script_results = currentParameters.script_results || {};
+                const resultKey = scriptDefinition.scriptId || scriptDefinition.filePath; // Use scriptId or filePath as key
+                currentParameters.script_results[resultKey] = executionResult.result;
+                logger.info({sessionId, scriptKey: resultKey, result: executionResult.result}, "Script result stored in default script_results namespace.")
+            }
+            // sessionData.parameters is a reference to currentParameters, so it's implicitly updated.
+
+        } else {
+            logger.info({ sessionId, scriptId: scriptDefinition.scriptId, dependencies: scriptDefinition.dependsOn }, `Dependencies NOT MET for script, skipping.`);
+        }
+    }
+}
+
+
+async function processInput(sessionId, intent, inputParameters = {}, initialCall = false, userInputText = null) { // Added userInputText
+    const sessionKey = `${FSM_SESSION_PREFIX}${sessionId}`;
+    let sessionData = await initializeOrRestoreSession(sessionId);
+    let currentSessionStateId = sessionData.currentStateId;
+
+    let currentParameters = { ...sessionData.parameters, ...inputParameters };
+    sessionData.parameters = currentParameters;
+
+    if (!sessionData.sync_api_results) sessionData.sync_api_results = {};
+    if (!sessionData.pendingApiResponses) sessionData.pendingApiResponses = {};
+
+    let effectiveIntent = intent;
+    if (!initialCall && !effectiveIntent && process.env.DEFAULT_INTENT) {
+        effectiveIntent = process.env.DEFAULT_INTENT;
+    }
+    logger.debug({ sessionId, currentSessionStateId, intent: effectiveIntent, inputParametersCount: Object.keys(inputParameters).length }, 'FSM processing input: Start');
+
+    const fsmCurrentStateConfigAtStart = getStateById(currentSessionStateId); // Config of state at start of this cycle
+    let candidateNextStateId = currentSessionStateId;
+    let candidateNextStateConfig = fsmCurrentStateConfigAtStart;
+    let transitionReason = "No transition initially";
+
+    // --- FASE PRELIMINAR: Determinar el estado objetivo (candidateNextStateId) ---
+    if (effectiveIntent && fsmCurrentStateConfigAtStart.transitions && fsmCurrentStateConfigAtStart.transitions.length > 0) {
+        for (const transition of fsmCurrentStateConfigAtStart.transitions) {
+            if (transition.condition && transition.condition.intent === effectiveIntent) {
+                candidateNextStateId = transition.nextState;
+                transitionReason = `Intent match: ${effectiveIntent}`;
+                break;
+            }
+        }
+    }
+    if (candidateNextStateId === currentSessionStateId) {
+        if (fsmCurrentStateConfigAtStart.transitions && fsmCurrentStateConfigAtStart.transitions.length > 0) {
+            for (const transition of fsmCurrentStateConfigAtStart.transitions) {
+                 if (transition.condition && !transition.condition.intent) {
+                    const requiredParams = fsmCurrentStateConfigAtStart.parameters?.required || [];
+                    const allRequiredMet = requiredParams.every(param => currentParameters.hasOwnProperty(param) && currentParameters[param] !== null && currentParameters[param] !== '');
+                    if ((typeof transition.condition.allParametersMet === 'undefined' || transition.condition.allParametersMet === true) && allRequiredMet) {
+                        candidateNextStateId = transition.nextState;
+                        transitionReason = 'All params met for current state';
+                        break;
+                    } else if (transition.condition.allParametersMet === false && !allRequiredMet ) { // Specific condition for not all params met
+                        candidateNextStateId = transition.nextState;
+                        transitionReason = 'Condition allParametersMet: false and not all met';
+                        break;
+                    }
+                 }
+            }
+        }
+    }
+    if (candidateNextStateId === currentSessionStateId && fsmCurrentStateConfigAtStart.defaultNextState) {
+        const requiredParams = fsmCurrentStateConfigAtStart.parameters?.required || [];
+        const allRequiredMet = requiredParams.every(param => currentParameters.hasOwnProperty(param) && currentParameters[param] !== null && currentParameters[param] !== '');
+        if (allRequiredMet) {
+            candidateNextStateId = fsmCurrentStateConfigAtStart.defaultNextState;
+            transitionReason = 'Default next state, all params met';
+        }
+    }
+
+    if (candidateNextStateId !== currentSessionStateId) {
+        candidateNextStateConfig = getStateById(candidateNextStateId);
+        if (!candidateNextStateConfig) {
+            logger.error({ candidateNextStateId, sessionId }, 'FSM Error: Config for candidate next state not found.');
+            throw new Error(`Config for candidate next state ${candidateNextStateId} not found.`);
+        }
+        logger.debug({ sessionId, from: currentSessionStateId, to: candidateNextStateId, reason: transitionReason }, 'FSM preliminary transition determined');
+    } else {
+        logger.debug({ sessionId, state: currentSessionStateId, reason: transitionReason }, 'FSM preliminary: staying in current state');
+    }
+
+    // --- NUEVA FASE: Procesar acciones de estados intermedios/saltados ---
+    const allStatesMap = getAllStatesConfig(); // Get all state configurations
+    const skippedStatesConfigs = getSkippedStates(currentSessionStateId, candidateNextStateId, allStatesMap);
+
+    if (skippedStatesConfigs.length > 0) {
+        logger.info({sessionId, skippedStates: skippedStatesConfigs.map(s => s.id)}, "Processing API hooks for skipped states.");
+        for (const skippedStateConfig of skippedStatesConfigs) {
+            logger.debug({sessionId, skippedStateId: skippedStateConfig.id}, "Processing hooks for skipped state.");
+            await executeApiHook('synchronousCallSetup', skippedStateConfig.payloadResponse?.apiHooks?.synchronousCallSetup, currentParameters, sessionId, sessionData);
+            // Execute scripts for skipped state
+            logger.info({sessionId, state: skippedStateConfig.id, type: 'SKIPPED_STATE'}, "Executing scriptHooks for skipped state.");
+            await executeScriptHook(skippedStateConfig.payloadResponse?.apiHooks?.executeScript, currentParameters, sessionId, sessionData);
+            await executeApiHook('asynchronousCallDispatch', skippedStateConfig.payloadResponse?.apiHooks?.asynchronousCallDispatch, currentParameters, sessionId, sessionData);
+        }
+    }
+
+    // --- Fase de API Síncronas del ESTADO OBJETIVO (candidateNextStateConfig) ---
+    logger.info({sessionId, state: candidateNextStateConfig.id, type: 'TARGET_STATE'}, "Executing synchronousCallSetup APIs for target state.");
+    await executeApiHook('synchronousCallSetup', candidateNextStateConfig.payloadResponse?.apiHooks?.synchronousCallSetup, currentParameters, sessionId, sessionData);
+
+    // --- Fase de Ejecución de Scripts del ESTADO OBJETIVO (candidateNextStateConfig) ---
+    logger.info({sessionId, state: candidateNextStateConfig.id, type: 'TARGET_STATE'}, "Executing scriptHooks for target state.");
+    await executeScriptHook(candidateNextStateConfig.payloadResponse?.apiHooks?.executeScript, currentParameters, sessionId, sessionData);
+
+    // --- Fase de Lógica de Transición FINAL (Confirmar candidateNextStateId) ---
+    // At this point, candidateNextStateId is considered the final destination for this cycle.
+    // Future: Could re-evaluate if sync API results from target state itself could trigger another immediate transition.
+    // For now, we commit to candidateNextStateId.
+    let finalNextStateId = candidateNextStateId;
+    let finalNextStateConfig = candidateNextStateConfig;
+
+    if (currentSessionStateId !== finalNextStateId) {
+        logger.info({ sessionId, fromState: currentSessionStateId, toState: finalNextStateId }, `FSM transitioning`);
+        sessionData.currentStateId = finalNextStateId;
+        if (!sessionData.history.length || sessionData.history[sessionData.history.length - 1] !== finalNextStateId) {
+            sessionData.history.push(finalNextStateId);
+        }
+    } else {
+        logger.debug({ sessionId, state: currentSessionStateId }, 'FSM staying in current state (final decision)');
+    }
+
+    // --- Fase de Renderizado de PayloadResponse (para finalNextStateConfig) ---
+    let renderedPayloadResponse = {};
+    if (finalNextStateConfig.payloadResponse) {
+        try {
+            renderedPayloadResponse = processTemplate(
+                JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse)),
+                currentParameters
+            );
+        } catch (templateError) {
+            logger.error({ err: templateError, sessionId, state: finalNextStateId }, `FSM Error: Processing payloadResponse template.`);
+            renderedPayloadResponse = JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse));
+        }
+    }
+
+    // --- Fase de API Asíncronas del ESTADO FINAL (finalNextStateConfig) ---
+    logger.info({sessionId, state: finalNextStateConfig.id, type: 'FINAL_STATE'}, "Executing asynchronousCallDispatch APIs for final state.");
+    await executeApiHook('asynchronousCallDispatch', finalNextStateConfig.payloadResponse?.apiHooks?.asynchronousCallDispatch, currentParameters, sessionId, sessionData);
+
+    const requiredForNext = finalNextStateConfig.parameters?.required || [];
+    const optionalForNext = finalNextStateConfig.parameters?.optional || [];
+    const parametersToCollect = {
+        required: requiredForNext.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === ''),
+        optional: optionalForNext.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === '')
+    };
+
+    saveSessionAsync(sessionKey, sessionData); // TTL will be handled by saveSessionAsync
+
+    logger.debug({ sessionId, finalState: finalNextStateId, paramsToCollectCount: parametersToCollect.required.length }, 'FSM processing complete.');
+
+    return {
+        nextStateId: finalNextStateId,
+        currentStateConfig: fsmCurrentStateConfigAtStart,
+        nextStateConfig: finalNextStateConfig,
+        parametersToCollect: parametersToCollect,
+        payloadResponse: renderedPayloadResponse,
+        sessionData: sessionData,
+    };
 }
 
 module.exports = {
   initializeOrRestoreSession,
   processInput,
-  saveSessionAsync, // Exported for potential use by index.js if session needs saving outside fsm.processInput
+  saveSessionAsync,
   FSM_SESSION_PREFIX
 };

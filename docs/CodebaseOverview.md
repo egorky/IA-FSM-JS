@@ -1,122 +1,138 @@
-# Visión General del Código Base - FSM con IA y API Sincrónicas/Asíncronas (Redis Streams)
+# Visión General del Código Base - FSM con IA, APIs Sincrónicas/Asíncronas, Scripts JS y Más
 
-Este documento detalla la estructura y flujo del proyecto FSM, ahora con capacidades de IA y manejo diferenciado de llamadas API síncronas y asíncronas.
+Este documento detalla la estructura y flujo del proyecto FSM, que ha sido extendido con capacidades avanzadas de IA, manejo de estados saltados, ejecución de scripts JS, dependencias configurables para acciones, y mejor gestión de datos.
 
 ## Estructura del Proyecto Clave
 
 ```
 .
 ├── config/
-│   ├── states.json                 # Lógica FSM. Ahora con payloadResponse.apiHooks.synchronousCallSetup y .asynchronousCallDispatch
-│   ├── aiPrompt.txt                # Prompt IA (instrucciones para usar sync_api_results y API Response Context)
-│   ├── aiResponseSchema.json       # Esquema validación IA
-│   ├── customAIResponseValidator.js # Validador JS personalizado IA
-│   └── api_definitions/            # Definiciones de API externas (url, method, plantillas, timeout, response_stream_key_template)
-│       └── (ej: fetch_user.json)
+│   ├── states.json                 # Lógica FSM. Incluye apiHooks para sync/async APIs y executeScript.
+│   ├── aiPrompt.txt                # Prompt IA.
+│   ├── aiResponseSchema.json       # Esquema validación IA.
+│   ├── customAIResponseValidator.js # Validador JS personalizado IA.
+│   ├── api_definitions/            # Definiciones de API externas.
+│   │   └── (ej: fetch_user.json)
+│   └── scripts/                    # Directorio para snippets de código JS ejecutables por la FSM.
+│       └── (ej: example/testScript.js)
 ├── docs/
-│   └── CodebaseOverview.md         # Este archivo
+│   ├── CodebaseOverview.md         # Este archivo.
+│   ├── ARI_Integration.md          # Documentación de la interfaz con Asterisk ARI.
+│   └── FSM_Documentation.md        # Documentación general de la FSM.
 ├── scripts/
-│   └── simulateApiResponder.js     # CLI para XADD respuestas API simuladas a Redis Streams
+│   └── simulateApiResponder.js     # CLI para simular respuestas API a Redis Streams (ahora con MAXLEN).
 ├── src/
-│   ├── index.js                    # Orquestador: maneja input, espera/lee de streams, llama IA, llama FSM
-│   ├── logger.js                   # Pino logger
-│   ├── aiService.js                # Interactúa con proveedores IA
-│   ├── jsonValidator.js            # Valida JSON de IA
-│   ├── apiConfigLoader.js          # Carga config/api_definitions/
-│   ├── apiCallerService.js         # Métodos makeRequestAndWait (sync) y makeRequestAsync (async) con Axios
-│   ├── configLoader.js             # Carga states.json
-│   ├── fsm.js                      # Motor FSM: ejecuta sync APIs, lógica de transición, despacha async APIs
-│   ├── redisClient.js              # Cliente Redis: funciones Stream (xadd, xreadgroup, xack, xgroupCreate), cliente subscriber
-│   └── templateProcessor.js        # Procesa plantillas ({{...}})
-├── .env.example                    # Variables de entorno (timeouts API, config Redis Stream)
-├── package.json                    # Dependencias (axios, uuid)
-└── README.md, AGENTS.md, FSM_Documentation.md # Documentación principal (actualizada)
+│   ├── index.js                    # Orquestador principal: maneja input, integra IA, FSM, Redis Streams.
+│   ├── logger.js                   # Pino logger.
+│   ├── aiService.js                # Interactúa con proveedores IA.
+│   ├── jsonValidator.js            # Valida JSON de IA.
+│   ├── apiConfigLoader.js          # Carga config/api_definitions/.
+│   ├── apiCallerService.js         # Métodos makeRequestAndWait (sync) y makeRequestAsync (async).
+│   ├── scriptExecutor.js           # Nuevo: Carga y ejecuta snippets de JS desde config/scripts/.
+│   ├── configLoader.js             # Carga states.json, ahora con getAllStates().
+│   ├── fsm.js                      # Motor FSM: lógica de transición, ejecución de APIs/scripts (con dependencias y manejo de estados saltados).
+│   ├── redisClient.js              # Cliente Redis: manejo de sesiones, funciones Stream.
+│   └── templateProcessor.js        # Procesa plantillas ({{...}}).
+├── env.example                     # Variables de entorno (actualizado con REDIS_SESSION_TTL, SIMULATOR_STREAM_MAXLEN).
+├── package.json                    # Dependencias.
+└── README.md, AGENTS.md            # Documentación principal (actualizada).
 ```
 
 ## Módulos Detallados y Flujo
 
 ### 1. `package.json`
-   - Añadidas `axios` (llamadas HTTP) y `uuid` (correlation IDs).
+   - Dependencias principales: `axios` (llamadas HTTP), `uuid` (correlation IDs), `ioredis`, `pino`.
 
 ### 2. `config/api_definitions/` y `src/apiConfigLoader.js`
    - `api_definitions/`: Contiene archivos JSON por API, definiendo `apiId`, `url`, `method`, plantillas para `headers`, `body_template`, `query_params_template`, `timeout_ms`, y `response_stream_key_template`.
-   - `apiConfigLoader.js`: Carga estas definiciones en memoria al inicio. Provee `getApiConfigById(apiId)`.
+   - `apiConfigLoader.js`: Carga estas definiciones en memoria al inicio. Provee `getApiConfigById(apiId)`. Las APIs definidas aquí ahora pueden tener dependencias especificadas en `states.json`.
 
-### 3. `src/apiCallerService.js` (Actualizado)
+### 3. `src/scriptExecutor.js` (Nuevo)
+   - Responsable de cargar y ejecutar de forma segura snippets de código JavaScript definidos en `config/scripts/`.
+   - Las funciones de script (identificadas por `functionName` en la configuración) reciben `currentParameters`, `logger`, y `sessionId`.
+   - Soporta scripts síncronos y asíncronos (controlado por `isAsync` en la configuración del script en `states.json`).
+   - Los resultados pueden ser asignados a `currentParameters` usando la propiedad `assignResultTo` en la configuración del script. Si no se especifica `assignResultTo`, los resultados se guardan en `currentParameters.script_results[scriptId_o_filePath]`.
+
+### 4. `src/apiCallerService.js`
    - `prepareRequestConfig()`: Función interna para procesar plantillas en URL, headers, body, query_params.
-   - `makeRequestAndWait(apiId, sessionId, correlationId, params)`:
-     - Usa `prepareRequestConfig`.
-     - Ejecuta la llamada HTTP con `await axios()`.
-     - Devuelve `{ status: 'success', data: ..., httpCode: ... }` o `{ status: 'error', errorMessage: ..., httpCode: ..., isTimeout: ... }`.
-     - Usado por `fsm.js` para APIs en `synchronousCallSetup`.
-   - `makeRequestAsync(apiId, sessionId, correlationId, params)`:
-     - Usa `prepareRequestConfig`.
-     - Ejecuta `axios()` sin `await` (fire-and-forget).
-     - Registra el despacho. La respuesta real es manejada por un worker externo que escribe al Redis Stream.
-     - Usado por `fsm.js` para APIs en `asynchronousCallDispatch`.
+   - `makeRequestAndWait(apiId, sessionId, correlationId, params)`: Usado por `fsm.js` para APIs en `synchronousCallSetup`. Bloquea y devuelve la respuesta.
+   - `makeRequestAsync(apiId, sessionId, correlationId, params)`: Usado por `fsm.js` para APIs en `asynchronousCallDispatch`. Es "fire-and-forget"; la respuesta se espera vía Redis Stream.
 
-### 4. `src/redisClient.js` (Actualizado)
+### 5. `src/redisClient.js`
    - Mantiene un cliente principal y un `subscriberClient` para operaciones bloqueantes de streams.
-   - Funciones añadidas/mejoradas: `xadd`, `xreadgroup`, `xack`, `xgroupCreate`.
-   - Mejor manejo de conexión/desconexión y logging.
+   - Funciones Stream: `xadd`, `xreadgroup`, `xack`, `xgroupCreate`.
+   - `getClient()`: Expone el cliente ioredis subyacente, usado por `simulateApiResponder.js` para `XADD` con `MAXLEN`.
+   - Manejo de conexión/desconexión y logging.
 
-### 5. `config/states.json` y `src/configLoader.js`
-   - `states.json`:
-     - `payloadResponse.apiHooks.synchronousCallSetup`: Array de `apiId`s. Estas APIs son llamadas por el servidor FSM, y sus respuestas se esperan **dentro del mismo turno de conversación**.
-     - `payloadResponse.apiHooks.asynchronousCallDispatch`: Array de `apiId`s (o definiciones más ricas si se adaptan). Estas APIs son llamadas por el servidor FSM de forma asíncrona (fire-and-forget). Sus respuestas se esperan en un **turno subsecuente** a través de Redis Streams.
-     - Plantillas `{{...}}` pueden ahora usar `{{sync_api_results.apiId.field}}` para acceder a resultados de llamadas síncronas del turno actual, y `{{async_api_results.apiId.field}}` (o similar, dependiendo de cómo `index.js` los guarde) para resultados de llamadas asíncronas de turnos anteriores. `customInstructions` para la IA pueden también usar estos.
-   - `configLoader.js`: Carga `states.json`.
+### 6. `config/states.json` y `src/configLoader.js`
+   - **`states.json`**:
+     - `payloadResponse.apiHooks`: Contiene `synchronousCallSetup`, `asynchronousCallDispatch`, y el nuevo `executeScript`.
+     - Cada acción dentro de estos arrays (API o script) ahora es un objeto que puede incluir:
+       - `apiId` (para APIs) o `scriptId`, `filePath`, `functionName` (para scripts).
+       - `dependsOn` (opcional): Un objeto que especifica `parameters` (requeridos del usuario/IA) y/o `apiResults` (IDs de otras APIs cuyos resultados son necesarios). La acción solo se ejecuta si se cumplen estas dependencias.
+     - `executeScript` (detalles):
+       - `scriptId`: Identificador lógico.
+       - `filePath`: Ruta relativa al script desde `config/scripts/` (ej. `subfolder/myScript.js`).
+       - `functionName`: Nombre de la función a ejecutar dentro del archivo script.
+       - `assignResultTo` (opcional): Clave para guardar el resultado del script en `currentParameters`.
+       - `isAsync` (opcional, default `false`): Si el script devuelve una Promesa.
+     - Plantillas `{{...}}` en `payloadResponse` pueden acceder a `{{sync_api_results...}}`, `{{async_api_results...}}`, y resultados de scripts (ej. `{{clave_asignada}}` o `{{script_results.scriptId.data}}`).
+   - **`configLoader.js`**:
+     - Añadida la función `getAllStates()` que devuelve el objeto de todos los estados. Usada por `fsm.js` para la lógica de estados saltados.
 
-### 6. `src/fsm.js` (`processInput` Refactorizado)
-   - **Fase 1: Inicialización y Determinación de Estado Objetivo para APIs Síncronas**:
-     - Carga sesión (que incluye `parameters`, `sync_api_results`, `pendingApiResponses`).
-     - Fusiona `inputParameters` (de la IA) con `sessionData.parameters`.
-     - Determina el `targetStateIdForSyncApis` (estado actual, o el siguiente si hay una transición por `intent` inmediata).
-   - **Fase 2: Ejecución de APIs Sincrónicas (`synchronousCallSetup`)**:
-     - Si `targetStateConfigForSyncApis.payloadResponse.apiHooks.synchronousCallSetup` existe:
-       - Para cada `apiId`: Llama `apiCallerService.makeRequestAndWait()`.
-       - Resultados (éxito o error estructurado) se guardan en `currentParameters.sync_api_results[apiId]`. `sessionData.parameters` se actualiza.
-       - Errores críticos aquí podrían llevar a un estado de error FSM.
-   - **Fase 3: Lógica de Transición FSM Principal**:
-     - Determina `nextStateId` final y `finalNextStateConfig` basado en `effectiveIntent` y `currentParameters` (que ahora incluyen `sync_api_results`).
-   - **Fase 4: Renderizado de `payloadResponse`**:
-     - El `payloadResponse` del `finalNextStateConfig` se renderiza usando `templateProcessor` con `currentParameters`. Plantillas aquí pueden acceder a `{{sync_api_results...}}`, `{{async_api_results...}}` (si `index.js` los puso en `currentParameters`), y parámetros normales.
-   - **Fase 5: Despacho de APIs Asíncronas (`asynchronousCallDispatch`)**:
-     - Si `finalNextStateConfig.payloadResponse.apiHooks.asynchronousCallDispatch` existe:
-       - Para cada `apiId`:
-         - Genera `correlationId` con `uuidv4()`.
-         - (Opcional: si `assignCorrelationIdTo` está en la definición, guarda el `correlationId` en `currentParameters`).
-         - Obtiene `response_stream_key_template` de la config de la API, la renderiza.
-         - Almacena `{ apiId, responseStreamKey, requestedAt }` en `sessionData.pendingApiResponses[correlationId]`.
-         - Llama a `apiCallerService.makeRequestAsync()` (fire-and-forget).
-   - **Guardado de Sesión**: `sessionData` (con todos los parámetros, `sync_api_results`, `pendingApiResponses` actualizados) se guarda en Redis.
-   - Devuelve la estructura de respuesta FSM.
+### 7. `src/fsm.js` (`processInput` significativamente refactorizado)
+   - **Gestión de Sesión**:
+     - `initializeOrRestoreSession`: Ahora también inicializa `sessionData.conversationHistory = []` para almacenar el historial de interacciones.
+     - `saveSessionAsync`: Utiliza `REDIS_SESSION_TTL` (de `env.example`) para la expiración de la sesión en Redis.
+   - **Flujo de Procesamiento Principal**:
+     1.  **Determinación Preliminar del Estado Objetivo**: Se calcula un `candidateNextStateId` basado en el `intent` actual y los `currentParameters`.
+     2.  **Procesamiento de Estados Saltados (`getSkippedStates`)**:
+         - Si `candidateNextStateId` no es una transición directa desde el estado actual, `getSkippedStates` intenta identificar los estados intermedios (saltados).
+         - Utiliza `getAllStatesConfig()` para acceder a la configuración de todos los estados y realizar un pathfinding básico.
+         - Para cada estado saltado identificado, se ejecutan secuencialmente:
+           - Sus `synchronousCallSetup` (vía `executeApiHook`).
+           - Sus `executeScript` (vía `executeScriptHook`).
+           - Sus `asynchronousCallDispatch` (vía `executeApiHook`).
+         - Todas estas ejecuciones respetan las cláusulas `dependsOn`.
+     3.  **Ejecución de Acciones del Estado Objetivo**:
+         - Se ejecutan los `synchronousCallSetup` del `candidateNextStateConfig`.
+         - Se ejecutan los `executeScript` del `candidateNextStateConfig`.
+     4.  **Transición Final y Renderizado**:
+         - Se confirma el `finalNextStateId` (actualmente el `candidateNextStateId`).
+         - Se actualiza `sessionData.currentStateId` y el historial de estados.
+         - Se renderiza el `payloadResponse` para el `finalNextStateConfig`, usando los `currentParameters` actualizados (que incluyen resultados de APIs síncronas y scripts).
+     5.  **Despacho Asíncrono del Estado Final**:
+         - Se ejecutan los `asynchronousCallDispatch` del `finalNextStateConfig`.
+   - **Funciones Auxiliares Clave**:
+     - `areDependenciesMet(dependsOn, currentParameters, sessionId)`: Verifica si las dependencias de una acción (API o script) se cumplen.
+     - `executeApiHook(hookType, hookConfigArray, ...)`: Encapsula la lógica para ejecutar arrays de definiciones de API síncronas o asíncronas, incluyendo el chequeo de dependencias.
+     - `executeScriptHook(scriptHookConfigArray, ...)`: Encapsula la lógica para ejecutar arrays de definiciones de script, chequeando dependencias y asignando resultados.
+   - **Parámetro `userInputText`**: `processInput` ahora acepta `userInputText`. Aunque la FSM no lo usa directamente para poblar `conversationHistory`, lo hace disponible para que el orquestador (`index.js`) pueda hacerlo.
 
-### 7. `src/index.js` (`handleInputWithAI` Actualizado)
-   - **Manejo de Entrada**: Acepta texto o JSON `{ userInput, waitForCorrelationId, initialCall }`.
-   - **Carga de Sesión**: Llama `fsm.initializeOrRestoreSession()`. `currentParameters` se inicializa desde `sessionData.parameters`.
-   - **Procesamiento de Respuestas Asíncronas de Streams**:
-     - **Si `waitForCorrelationId`**: Llama a `processSingleAwaitedApiResponse()`:
-       - Hace `XREADGROUP ... BLOCK` en el stream de respuesta esperado (de `sessionData.pendingApiResponses`).
-       - Procesa el mensaje (éxito/error/timeout), lo añade a `fullTextInputForAI`, actualiza `currentParameters.async_api_results.{apiId}_data` o `_error`. Hace `XACK`. Elimina de `pendingApiResponses`.
-       - Si hay timeout del `BLOCK`, añade contexto de timeout a `fullTextInputForAI` y `currentParameters`.
-     - **Otras Respuestas Pendientes**: Llama a `checkNonAwaitedApiResponses()`:
-       - Itera `pendingApiResponses`, hace `XREADGROUP` con timeout corto en cada stream. Procesa, combina, ACKea y actualiza similarmente.
-   - **Guardado Intermedio de Sesión**: Si `pendingApiResponses` o `currentParameters` cambiaron debido a respuestas de streams, se guarda `sessionData`.
-   - **Llamada a IA**: `aiService.getAIResponse(fullTextInputForAI, aiPromptContent)`.
-   - **Validación de IA**.
-   - **Llamada Principal a FSM**: `fsm.processInput(sessionId, aiIntent, aiParametersFromAI, initialCallFlag)`.
-     - Nota: `fsm.processInput` recibe los `aiParameters` y los fusiona con los `currentParameters` de la sesión (que ya incluyen `async_api_results`). Luego `fsm.processInput` añade `sync_api_results`.
-   - Registra E/S en Redis. Devuelve resultado FSM.
+### 8. `src/index.js` (`handleInputWithAI` - Cambios Conceptuales Implicados por las nuevas funcionalidades)
+   - **Construcción del Prompt para IA**:
+     - Antes de llamar a `aiService.getAIResponse`, `index.js` es responsable de construir un `fullTextInputForAI` más completo. Este debería incluir:
+       - El texto del usuario actual (`userInput`).
+       - Contexto de respuestas de API asíncronas del ciclo anterior (ej. `[API Response Context...]`).
+       - Un historial formateado de la conversación (de `sessionData.conversationHistory`).
+       - Una representación de los parámetros ya recolectados (de `sessionData.parameters`, filtrando namespaces internos).
+       - Las `customInstructions` del `payloadResponse` del estado FSM anterior (ya renderizadas).
+   - **Poblado de `conversationHistory`**:
+     - Después de que `fsm.processInput` devuelve su resultado, y antes de enviar la respuesta final al cliente, `index.js` debería:
+       - Tomar el `userInputText` original.
+       - Tomar el prompt principal enviado al usuario (ej. `renderedPayloadResponse.prompts.main`).
+       - Añadir este par `{userInput: userInputText, aiOutput: promptPrincipal}` a `sessionData.conversationHistory`.
+       - Guardar la sesión actualizada en Redis.
+   - **Paso de `userInputText` a FSM**: `index.js` debe pasar el `userInputText` a `fsm.processInput`.
 
-### 8. `config/aiPrompt.txt` (Actualizado)
-   - Incluye instrucciones para que la IA use:
-     - Datos de `customInstructions` que pueden contener `{{sync_api_results...}}` (ya renderizados cuando la IA los ve).
-     - Contexto de `[API Response Context ...]` o `[API Error Context ...]` para resultados de llamadas asíncronas de turnos anteriores.
+### 9. `config/aiPrompt.txt`
+   - No se modifica directamente, pero su efectividad se ve reforzada por el prompt más contextualizado que `index.js` debería construir (con historial, parámetros recolectados, etc.).
 
-### 9. `scripts/simulateApiResponder.js` (Actualizado)
-   - Herramienta CLI: `node scripts/simulateApiResponder.js <responseStreamKey> <sessionId> <correlationId> <apiId> [status] [httpCode] [customDataJsonString]`.
-   - Usa `redisClient.xadd()` para escribir un mensaje formateado (ver Plan Paso 5 para formato) al `responseStreamKey` especificado. Simula un worker externo que responde a una llamada API.
+### 10. `scripts/simulateApiResponder.js`
+   - Actualizado para usar `MAXLEN ~ <count>` en la llamada `XADD` a Redis, ayudando a controlar el tamaño de los streams para fines de simulación. La longitud máxima es configurable mediante la variable de entorno `SIMULATOR_STREAM_MAXLEN`.
+
+### 11. `env.example`
+   - Actualizado para incluir `REDIS_SESSION_TTL` y `SIMULATOR_STREAM_MAXLEN`.
 
 ---
 *Fin del documento.*
