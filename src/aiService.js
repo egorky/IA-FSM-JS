@@ -1,6 +1,6 @@
 // src/aiService.js
 const OpenAI = require('openai');
-const { GoogleGenAI } = require('@google/genai'); // Corrected import name
+const { GoogleGenAI, Type } = require('@google/genai'); // Corrected import name, added Type
 const Groq = require('groq-sdk');
 const redisClient = require('./redisClient');
 const logger = require('./logger'); // Assuming pino logger is set up in logger.js
@@ -65,31 +65,59 @@ async function getGoogleGeminiResponse(textInput, prompt) {
     throw new Error('Google Gemini provider selected but API key not provided or client not initialized.');
   }
   const fullPrompt = `${prompt}\n\nInput Text: "${textInput}"\n\nRespond with a valid JSON object. Output JSON:\n`;
-  // Gemini specific instructions for JSON output might be needed here or in the prompt itself.
-  // Forcing JSON output with Gemini can be tricky. The prompt needs to be very specific.
-  // And often, you need to wrap the expected JSON in ```json ... ``` markers in the prompt.
+  // Gemini specific instructions for JSON output are now primarily handled by responseSchema.
+  // The prompt should still guide towards a JSON structure.
   await logToRedis(`ai_input:google:${Date.now()}`, { textInput, prompt: fullPrompt });
 
   try {
-    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || "gemini-pro" });
-    const result = await model.generateContent(fullPrompt, { timeout: AI_REQUEST_TIMEOUT });
-    const response = await result.response;
-    const text = response.text();
+    const modelName = process.env.GEMINI_MODEL || "gemini-pro"; // e.g., "gemini-1.5-flash-latest" or "gemini-pro"
 
-    if (!text) {
-      throw new Error('Google Gemini response content is empty.');
+    const response = await genAI.models.generateContent({
+      model: modelName,
+      contents: [{role: "user", parts: [{text: fullPrompt}]}],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            intent: { type: Type.STRING },
+            parameters: {
+              type: Type.OBJECT,
+              // We can't easily define arbitrary key-value pairs for parameters here
+              // without knowing all possible parameters.
+              // So, we allow additional properties for the parameters object.
+              // For stricter validation, a more detailed schema would be needed if
+              // the set of parameters were fixed.
+            }
+          },
+          required: ["intent", "parameters"]
+        },
+        temperature: parseFloat(process.env.GEMINI_TEMPERATURE) || 0.7,
+        // topP: ..., // Other generation config if needed
+        // topK: ...,
+      }
+    }, { timeout: AI_REQUEST_TIMEOUT });
+
+    // When responseSchema is used, the response should ideally be directly parseable JSON.
+    // The exact way to access it from the `response` object from `generateContent` needs care.
+    // Based on some SDK examples, `response.text` might still be the way, or it might be nested.
+    // Let's assume response.text() is the primary way as per documentation for schema usage.
+    // If the API directly returns a JSON object in a specific field when schema is used, that would be better.
+    // For now, we rely on response.text() and then JSON.parse.
+
+    // The generateContent directly returns the GenerateContentResponse object
+    // which has a text() method.
+    const responseText = response.text();
+
+    if (!responseText) {
+      throw new Error('Google Gemini response text is empty, even with responseSchema.');
     }
 
-    // Extract JSON from potentially markdown-formatted response
-    let jsonText = text;
-    const jsonRegex = /```json\s*([\s\S]*?)\s*```/;
-    const match = text.match(jsonRegex);
-    if (match && match[1]) {
-      jsonText = match[1];
-    }
+    // No need to extract from markdown ```json ... ``` if responseMimeType and responseSchema work as expected.
+    // The model should directly output JSON.
+    await logToRedis(`ai_output:google:${Date.now()}`, { response: responseText });
+    return JSON.parse(responseText);
 
-    await logToRedis(`ai_output:google:${Date.now()}`, { response: jsonText });
-    return JSON.parse(jsonText);
   } catch (error) {
     logger.error({ err: error, textInput, prompt }, 'Error getting response from Google Gemini');
     await logToRedis(`ai_error:google:${Date.now()}`, { error: error.message, textInput, prompt });
