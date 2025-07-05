@@ -9,7 +9,8 @@ const { startSocketServer, stopSocketServer } = require('./socketServer');
 const redisClient = require('./redisClient');
 const { connectAri, closeAri } = require('./ariClient');
 const fsm = require('./fsm'); // Contains FSM_SESSION_PREFIX, initializeOrRestoreSession, processInput, saveSessionAsync
-const { loadStateConfig, getStateById } = require('./configLoader'); // getStateById might be useful
+const { loadStateConfig, getStateById } = require('./configLoader');
+const { processTemplate } = require('./templateProcessor'); // Added templateProcessor
 const aiService = require('./aiService');
 const jsonValidator = require('./jsonValidator');
 const { validateAIResponse: customAIResponseValidator } = require('../config/customAIResponseValidator');
@@ -169,8 +170,33 @@ async function handleInputWithAI(sessionId, clientInput, source) {
     .catch(err => logger.error({ err, sessionId }, 'Failed to log input_text to Redis'));
 
   let sessionData = await fsm.initializeOrRestoreSession(sessionId);
-  let currentParameters = { ...sessionData.parameters };
+  let currentParameters = { ...sessionData.parameters }; // Parameters before this turn's FSM processing
   let fullTextInputForAI = userInputText;
+
+  // Get customInstructions from the current state for the AI prompt
+  const currentStateId = sessionData.currentStateId;
+  const stateConfig = getStateById(currentStateId);
+  let renderedCustomInstructions = "";
+
+  if (stateConfig && stateConfig.payloadResponse && stateConfig.payloadResponse.customInstructions) {
+    try {
+      // Render customInstructions using parameters available *before* this turn's sync operations
+      // These are parameters from the session, including async_api_results from previous turns.
+      renderedCustomInstructions = processTemplate(
+        stateConfig.payloadResponse.customInstructions,
+        currentParameters // Use parameters as they are at this point
+      );
+      logger.debug({ sessionId, currentStateId, renderedCustomInstructions }, "Rendered customInstructions for AI prompt.");
+    } catch (templateError) {
+      logger.error({ err: templateError, sessionId, currentStateId }, "Error rendering customInstructions for AI prompt.");
+    }
+  }
+
+  // Prepend custom instructions to the AI input if they exist
+  if (renderedCustomInstructions) {
+    fullTextInputForAI = `State Instructions: "${renderedCustomInstructions}"\n\nUser Input: "${fullTextInputForAI}"`;
+  }
+
 
   // Process explicitly awaited API response first
   if (waitForCorrelationId && sessionData.pendingApiResponses && sessionData.pendingApiResponses[waitForCorrelationId]) {
@@ -214,7 +240,8 @@ async function handleInputWithAI(sessionId, clientInput, source) {
   } else {
     redisClient.set(`ai_actual_input:${sessionId}:${Date.now()}`, JSON.stringify({ textForAI: fullTextInputForAI }), 'EX', 3600).catch(err => logger.error({ err, sessionId }, 'Log ai_actual_input failed'));
     try {
-      const aiJsonResponse = await aiService.getAIResponse(fullTextInputForAI, aiPromptContent);
+      // Pass sessionId to getAIResponse for enhanced logging in aiService
+      const aiJsonResponse = await aiService.getAIResponse(fullTextInputForAI, aiPromptContent, sessionId);
       const schemaValidationResult = jsonValidator.validateJson(aiJsonResponse);
       if (!schemaValidationResult.isValid) {
         logger.warn({ sessionId, errors: schemaValidationResult.errors, aiResponse: aiJsonResponse }, 'AI response schema validation failed.');
