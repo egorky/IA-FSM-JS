@@ -11,7 +11,7 @@
         "prompts": {
           "main": "Estimado cliente, bienvenido. Hoy es {{current_date}}"
         },
-        "customInstructions": "solicita al cliente su número de identificación. Current time: {{current_time}}",
+        "customInstructions": "El usuario está en el primer paso y necesita proporcionar su número de identificación. Analiza el siguiente texto del usuario. Si el texto es una secuencia numérica y el contexto es la solicitud de identificación, extráelo como el parámetro 'id_document_number'. No asumas que es un número de teléfono en este estado. Current time: {{current_time}}",
         "uiHints": { "ageInputType": "number" },
         "apiHooks": {
           "onEnterState": ["api_log_interaction_start"],
