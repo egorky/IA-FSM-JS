@@ -3,20 +3,45 @@
   "states": {
     "1_welcome": {
       "id": "1_welcome",
-      "description": "Dar la bienvenida al paciente y capturar su número de identificación para extraer toda su información.",
-      "parameters": {
-        "required": ["id_document_number"]
+      "description": "Dar la bienvenida al paciente y capturar su número de identificación.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["id_document_number"]
+        },
+        "onEntry": [
+          {
+            "label": "Log Interaction Start",
+            "type": "API",
+            "id": "api_log_interaction_start",
+            "executionMode": "ASYNCHRONOUS"
+          },
+          {
+            "label": "Fetch Full User Profile Async with Wait",
+            "type": "API",
+            "id": "api_get_full_user",
+            "executionMode": "ASYNCHRONOUS",
+            "ignoreIfOutputExists": true,
+            "waitForResult": {
+              "point": "BEFORE_AI_PROMPT_NEXT_TURN",
+              "timeoutMs": 3500,
+              "onTimeoutFallback": {
+                "mapToProducesParameters": {
+                  "userName": "Cliente (Info no disp.)",
+                  "userEmail": "no-email@timeout.com",
+                  "userAge": -1,
+                  "apiTimeoutOccurred": true
+                }
+              }
+            }
+          }
+        ]
       },
       "payloadResponse": {
         "prompts": {
           "main": "Estimado cliente, bienvenido. Hoy es {{current_date}}"
         },
         "customInstructions": "El usuario está en el primer paso y necesita proporcionar su número de identificación. Analiza el siguiente texto del usuario. Si el texto es una secuencia numérica y el contexto es la solicitud de identificación, extráelo como el parámetro 'id_document_number'. No asumas que es un número de teléfono en este estado. Current time: {{current_time}}",
-        "uiHints": { "ageInputType": "number" },
-        "apiHooks": {
-          "onEnterState": ["api_log_interaction_start"],
-          "asynchronousCallDispatch": ["api_get_full_user"]
-        }
+        "uiHints": { "ageInputType": "number" }
       },
       "transitions": [
         {
@@ -32,20 +57,58 @@
     },
     "2_get_city": {
       "id": "2_get_city",
-      "description": "Solicitar al paciente que diga en qué ciudad donde quiere ser atendido. Para saludarlo, se requiere que el resultado de api_get_full_user (asíncrono del estado anterior) esté disponible. Se llama api_get_city_id sincrónicamente.",
-      "parameters": {
-        "required": ["city_name"]
+      "description": "Solicitar al paciente que diga en qué ciudad quiere ser atendido.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["city_name"]
+        },
+        "onEntry": [
+          {
+            "label": "Log City Entry State",
+            "type": "API",
+            "id": "api_log_enter_get_id_state",
+            "executionMode": "ASYNCHRONOUS"
+          },
+          {
+            "label": "Get City Definitions",
+            "type": "API",
+            "id": "api_get_city_id",
+            "executionMode": "SYNCHRONOUS"
+          },
+          {
+            "label": "Prepare City Prompt Script",
+            "type": "SCRIPT",
+            "id": "prepareCityPrompt",
+            "filePath": "prompt_formatters/city_prompts.js",
+            "functionName": "formatCityGreeting",
+            "assignResultTo": "customCityGreetingForPrompt",
+            "executionMode": "SYNCHRONOUS",
+            "consumesParameters": {
+              "userFullName": {
+                "source": "COLLECTED_PARAM",
+                "paramName": "userName",
+                "required": true
+              },
+              "citiesMapData": {
+                "source": "COLLECTED_PARAM",
+                "paramName": "availableCitiesMap",
+                "required": true
+              },
+              "currentHour": {
+                "source": "SESSION_DATA",
+                "path": "timeContext.hour",
+                "required": false
+              }
+            }
+          }
+        ]
       },
       "payloadResponse": {
         "prompts": {
-          "main": "Gracias, {{ async_api_results.api_get_full_user.name }}. Por favor, dime en qué ciudad quieres ser atendido.",
+          "main": "{{customCityGreetingForPrompt}}. Por favor, dime en qué ciudad quieres ser atendido.",
           "validationExample": "Las opciones pueden ser: Guayaquil y Quito."
         },
-        "customInstructions": "Utilizando la ciudad que el humano te da: {{city_name}} y el JSON que te entrega los Id de cada ciudad: {{ sync_api_results.api_get_city_id.id }} construye un JSON de salida cuyo key será city_id. Current time: {{current_time}}",
-        "apiHooks": {
-          "onEnterState": ["api_log_enter_get_id_state"],
-          "synchronousCallSetup": ["api_get_city_id"]
-        }
+        "customInstructions": "Utilizando la ciudad que el humano te da: {{city_name}} y el JSON que te entrega los Id de cada ciudad: {{availableCitiesMap}} construye un JSON de salida cuyo key será city_id. Current time: {{current_time}}"
       },
       "transitions": [
         {
@@ -61,21 +124,32 @@
     },
     "3_get_specialty": {
       "id": "3_get_specialty",
-      "description": "Preguntar por la especialidad médica requerida. api_list_specialties se llama asincrónicamente para el siguiente ciclo.",
-      "parameters": {
-        "required": ["medical_specialty"]
+      "description": "Preguntar por la especialidad médica requerida.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["medical_specialty"]
+        },
+        "onEntry": [
+          {
+            "label": "Log Fetch Available Specialties",
+            "type": "API",
+            "id": "api_log_fetch_available_specialties",
+            "executionMode": "ASYNCHRONOUS"
+          },
+          {
+            "label": "List Specialties for Next Cycle",
+            "type": "API",
+            "id": "api_list_specialties",
+            "executionMode": "ASYNCHRONOUS"
+          }
+        ]
       },
       "payloadResponse": {
-        "apiHooks": {
-          "onEnterState": ["api_log_fetch_available_specialties"],
-          "asynchronousCallDispatch": ["api_list_specialties"]
-        },
         "prompts": {
           "main": "En qué especialidad médica quieres ser atendido?",
           "validationExample": "Deben ser especialidades médicas"
         },
-        "tools": {},
-        "customInstructions": "Utilizando la especialidad que el humano te da: {{medical_specialty}} y el JSON que te entrega los Id de cada especialidad (del próximo ciclo): {{ async_api_results.api_list_specialties.speciality_id }} construye un JSON de salida cuyo key será specialty_id. Current time: {{current_time}}"
+        "customInstructions": "Utilizando la especialidad que el humano te da: {{medical_specialty}} y el JSON que te entrega los Id de cada especialidad (del próximo ciclo): {{async_api_results.api_list_specialties.speciality_id}} construye un JSON de salida cuyo key será specialty_id. Current time: {{current_time}}"
       },
       "transitions": [
         {
@@ -91,20 +165,32 @@
     },
     "4_get_office_preference": {
       "id": "4_get_office_preference",
-      "description": "Preguntar si tiene preferencia de sucursal. api_get_office_id se llama asincrónicamente.",
-      "parameters": {
-        "required": ["preferred_office_name"]
+      "description": "Preguntar si tiene preferencia de sucursal.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["preferred_office_name"]
+        },
+        "onEntry": [
+          {
+            "label": "Log Office Preference",
+            "type": "API",
+            "id": "api_log_office_preference",
+            "executionMode": "ASYNCHRONOUS"
+          },
+          {
+            "label": "Get Office ID for Next Cycle",
+            "type": "API",
+            "id": "api_get_office_id",
+            "executionMode": "ASYNCHRONOUS"
+          }
+        ]
       },
       "payloadResponse": {
-        "apiHooks": {
-          "onEnterState": ["api_log_office_preference"],
-          "asynchronousCallDispatch": ["api_get_office_id"]
-        },
         "prompts": {
           "main": "En qué sucursal quieres ser atendido para la especialidad {{medical_specialty}}?",
           "validationExample": "Deben ser sucursales válidas"
         },
-        "customInstructions": "Utilizando la sucursal que el humano prefiere: {{preferred_office_name}} y el JSON que te entrega los Id de cada sucursal (del próximo ciclo): {{ async_api_results.api_get_office_id.preferred_office_id }} construye un JSON de salida cuyo key será office_id. Current time: {{current_time}}"
+        "customInstructions": "Utilizando la sucursal que el humano prefiere: {{preferred_office_name}} y el JSON que te entrega los Id de cada sucursal (del próximo ciclo): {{async_api_results.api_get_office_id.preferred_office_id}} construye un JSON de salida cuyo key será office_id. Current time: {{current_time}}"
       },
       "transitions": [
         {
@@ -120,20 +206,27 @@
     },
     "5_get_appointment_day": {
       "id": "5_get_appointment_day",
-      "description": "Pedir al paciente el día en el que desea la cita. api_get_dates se llama asincrónicamente.",
-      "parameters": {
-        "required": ["appointment_date"]
+      "description": "Pedir al paciente el día en el que desea la cita.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["appointment_date"]
+        },
+        "onEntry": [
+          {
+            "label": "Get Dates for Next Cycle",
+            "type": "API",
+            "id": "api_get_dates",
+            "executionMode": "ASYNCHRONOUS"
+          }
+        ]
       },
       "payloadResponse": {
         "uiHints": { "datePickerFormat": "YYYY-MM-DD" },
-        "apiHooks": {
-          "asynchronousCallDispatch": ["api_get_dates"]
-        },
         "prompts": {
           "main": "Qué día deseas la cita médica?",
           "validationExample": "Deben ser formato de día a partir de hoy {{current_date}}"
         },
-        "customInstructions": "Con la fecha que el humano pide: {{appointment_date}} y el JSON que te entrega las fechas disponibles (del próximo ciclo): {{ async_api_results.api_get_dates }} construye un JSON de salida que devuelva las 4 fechas siguientes a partir de hoy {{current_date}}, todas en un JSON con keys possibleDates. Current time: {{current_time}}"
+        "customInstructions": "Con la fecha que el humano pide: {{appointment_date}} y el JSON que te entrega las fechas disponibles (del próximo ciclo): {{async_api_results.api_get_dates}} construye un JSON de salida que devuelva las 4 fechas siguientes a partir de hoy {{current_date}}, todas en un JSON con keys possibleDates. Current time: {{current_time}}"
       },
       "transitions": [
         {
@@ -149,20 +242,32 @@
     },
     "6_get_appointment_time": {
       "id": "6_get_appointment_time",
-      "description": "Pedir y confirmar la hora de la cita. api_book_appointment_slot se llama asincrónicamente.",
-      "parameters": {
-        "required": ["appointment_time"]
+      "description": "Pedir y confirmar la hora de la cita.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["appointment_time"]
+        },
+        "onEntry": [
+          {
+            "label": "Log Date Provided",
+            "type": "API",
+            "id": "api_log_date",
+            "executionMode": "ASYNCHRONOUS"
+          },
+          {
+            "label": "Book Appointment Slot", // Potentially for Next Cycle or made Sync
+            "type": "API",
+            "id": "api_book_appointment_slot",
+            "executionMode": "ASYNCHRONOUS"
+          }
+        ]
       },
       "payloadResponse": {
-        "apiHooks": {
-          "onEnterState": ["api_log_date"],
-          "asynchronousCallDispatch": ["api_book_appointment_slot"]
-        },
         "prompts": {
           "main": "Para qué hora del día {{appointment_date}} deseas la cita ?",
           "validationExample": "Deben ser formato de hora a partir de hoy {{current_time}}"
         },
-        "customInstructions": "Con la hora que el humano pide: {{appointment_time }} y el JSON que te entrega las fechas disponibles (del próximo ciclo): {{ async_api_results.api_book_appointment_slot }} construye un JSON de salida que devuelva las 4 fechas siguientes a partir de la hora en este momento que es {{current_time}}, todas en un JSON con keys possibleTimes."
+        "customInstructions": "Con la hora que el humano pide: {{appointment_time}} y el JSON que te entrega las fechas disponibles (del próximo ciclo): {{async_api_results.api_book_appointment_slot}} construye un JSON de salida que devuelva las 4 fechas siguientes a partir de la hora en este momento que es {{current_time}}, todas en un JSON con keys possibleTimes."
       },
       "transitions": [
         {
@@ -182,59 +287,69 @@
     "7_confirmation_and_closing": {
       "id": "7_confirmation_and_closing",
       "description": "Confirmar todos los detalles de la cita agendada y despedirse.",
-      "parameters": {},
+      "stateLogic": {
+        "onEntry": [
+          { "type": "API", "id": "api_send_confirmation_message", "executionMode": "ASYNCHRONOUS" },
+          { "type": "API", "id": "api_log_interaction_complete", "executionMode": "ASYNCHRONOUS" }
+        ]
+      },
       "payloadResponse": {
         "finalMessage": "Su cita para {{medical_specialty}} el {{appointment_date}} a las {{appointment_time}} ha sido confirmada. ¡Gracias, {{capitalize(caller_name)}}!",
         "summaryForSystem": "Cita: {{medical_specialty}}, Día: {{appointment_date}}, Hora: {{appointment_time}}, Paciente: {{patient_id_number}}, Edad: {{patient_age}}",
         "totalCost": "Costo total: {{formatNumber(cost, 2)}}",
         "nextAppointmentRecommendation": "{{sandbox_js: const d = new Date(collectedParameters.appointment_date); d.setMonth(d.getMonth() + 6); return 'Próxima revisión sugerida: ' + d.toISOString().split('T')[0]; }}",
-        "dynamicGreetingBasedOnTime": "{{sandbox_js: const h = new Date().getHours(); if (h < 12) return 'Buenos días'; else if (h < 18) return 'Buenas tardes'; else return 'Buenas noches';}} {{caller_name}}",
-        "apiHooks": {
-          "onEnterState": ["api_send_confirmation_message", "api_log_interaction_complete"]
-        }
+        "dynamicGreetingBasedOnTime": "{{sandbox_js: const h = new Date().getHours(); if (h < 12) return 'Buenos días'; else if (h < 18) return 'Buenas tardes'; else return 'Buenas noches';}} {{caller_name}}"
       },
       "transitions": []
     },
     "98_age_ineligible": {
       "id": "98_age_ineligible",
-      "description": "Informar al usuario que no es elegible por edad y finalizar. (Ejemplo, no en tu config)",
+      "description": "Informar al usuario que no es elegible por edad y finalizar.",
+      "stateLogic": {
+        "onEntry": [
+          { "type": "API", "id": "api_log_ineligible_interaction", "executionMode": "ASYNCHRONOUS" },
+          { "type": "API", "id": "api_send_age_ineligible_notification", "executionMode": "ASYNCHRONOUS" }
+        ]
+      },
       "payloadResponse": {
-        "messageToUser": "Lo sentimos {{default(caller_name, '')}}, no cumple con el requisito de edad ({{patient_age}}) para este servicio. Registrado a las {{current_time}}.",
-        "apiHooks": {
-          "onEnterState": ["api_log_ineligible_interaction", "api_send_age_ineligible_notification"]
-        }
+        "finalMessage": "Lo sentimos {{default(caller_name, '')}}, no cumple con el requisito de edad ({{patient_age}}) para este servicio. Registrado a las {{current_time}}."
       },
       "transitions": []
     },
     "99_transfer_to_human": {
       "id": "99_transfer_to_human",
       "description": "Transferir la conversación a un agente humano.",
+      "stateLogic": {
+        "onEntry": [
+          { "type": "API", "id": "api_initiate_transfer_to_human_agent", "executionMode": "ASYNCHRONOUS" },
+          { "type": "API", "id": "api_log_transfer_request", "executionMode": "ASYNCHRONOUS" }
+        ]
+      },
       "payloadResponse": {
-        "transferMessage": "Un momento, {{capitalize(caller_name)}}, por favor, lo transferiré con un agente. Hora de solicitud: {{current_datetime}}.",
-        "apiHooks": {
-          "onEnterState": ["api_initiate_transfer_to_human_agent", "api_log_transfer_request"]
-        }
+        "transferMessage": "Un momento, {{capitalize(caller_name)}}, por favor, lo transferiré con un agente. Hora de solicitud: {{current_datetime}}."
       },
       "transitions": []
     },
     "2_get_patient_id_retry_invalid": {
       "id": "2_get_patient_id_retry_invalid",
-      "description": "Informar que la cédula es inválida y solicitarla de nuevo. (Ejemplo, no en tu config)",
-      "parameters": {
-         "required": ["patient_id_number"],
-         "optional": ["id_document_type"]
+      "description": "Informar que la cédula es inválida y solicitarla de nuevo.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["patient_id_number"],
+          "optional": ["id_document_type"]
+        },
+        "onEntry": [
+          { "type": "API", "id": "api_log_id_retry_event", "executionMode": "ASYNCHRONOUS" }
+        ]
       },
       "payloadResponse": {
-        "retryPrompt": "El número de identificación ingresado no es válido. Por favor, inténtelo de nuevo.",
-        "apiHooks": {
-          "onEnterState": ["api_log_id_retry_event"],
-          "beforeCollectingParameters": ["api_get_id_input_retry_instructions"],
-          "afterParametersCollected": ["api_validate_id_format", "api_log_id_provided_after_retry"]
+        "prompts": {
+            "main": "El número de identificación ingresado no es válido. Por favor, inténtelo de nuevo."
         }
       },
       "transitions": [
         {
-          "nextState": "3_get_specialty",
+          "nextState": "2_get_city",
           "condition": { "allParametersMet": true }
         },
         {
@@ -242,19 +357,26 @@
           "condition": { "intent": "request_human_agent_after_max_retries" }
         }
       ],
-      "defaultNextState": "3_get_specialty"
+      "defaultNextState": "2_get_city"
     },
      "6_retry_appointment_time": {
       "id": "6_retry_appointment_time",
-      "description": "Informar que la hora no está disponible y solicitar otra. (Ejemplo, no en tu config)",
-      "parameters": {
-        "required": ["appointment_time"]
+      "description": "Informar que la hora no está disponible y solicitar otra.",
+      "stateLogic": {
+        "awaitsUserInputParameters": {
+          "required": ["appointment_time"]
+        },
+        "onEntry": [
+          { "type": "API", "id": "api_log_time_retry_event", "executionMode": "ASYNCHRONOUS" },
+          {
+            "type": "API", "id": "api_fetch_alternative_slots",
+            "executionMode": "SYNCHRONOUS"
+          }
+        ]
       },
       "payloadResponse": {
-        "unavailablePrompt": "La hora seleccionada ya no está disponible. Por favor, elija otra hora.",
-        "apiHooks": {
-          "onEnterState": ["api_log_time_retry_event", "api_fetch_alternative_slots"],
-          "afterParametersCollected": ["api_book_appointment_slot"]
+        "prompts": {
+            "main": "La hora seleccionada ya no está disponible. {{#if alternativeSlotsData}}Aquí hay algunas alternativas: {{alternativeSlotsData}}. {{/if}}Por favor, elija otra hora."
         }
       },
       "transitions": [
@@ -274,3 +396,4 @@
     }
   }
 }
+```
