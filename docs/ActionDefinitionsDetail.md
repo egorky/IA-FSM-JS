@@ -107,9 +107,50 @@ Describe cada parámetro que esta API necesita para construir su `url_template`,
     -   **`path` (String, Obligatorio si `source: "SESSION_DATA"`):** Path (notación de puntos) al valor dentro del objeto `sessionData`. Ejemplo: `"callDetails.callerId"`.
     -   **`paramName` (String, Obligatorio si `source: "COLLECTED_PARAM"`):** El nombre del parámetro tal como existe en `currentParameters`.
     -   **`required` (Booleano, Opcional, Default: `true`):** Si `true`, la FSM considerará que esta dependencia debe cumplirse para ejecutar la API. Si `false`, la API podría llamarse incluso si este parámetro no se resuelve (la plantilla de la API debe ser capaz de manejar un valor faltante, por ejemplo, no incluyendo un query param opcional).
-    -   `mapTo` (String, Opcional): Si el nombre usado en la plantilla de esta API (la clave) es diferente al `aiParamName` o `producedParamName`, se puede usar `mapTo` para especificar el nombre en la plantilla. Generalmente no es necesario si las claves de `consumesParameters` ya son los nombres de las plantillas.
 
--   **Ejemplo:**
+-   **Ejemplo de `consumesParameters`:**
+    ```json
+    "consumesParameters": {
+      "userIdInUrl": { "source": "USER_INPUT", "aiParamName": "id_document_number", "required": true },
+      "authToken": { "source": "COLLECTED_PARAM", "paramName": "activeApiToken", "required": true },
+      "productDetails": { "source": "API_RESULT", "apiId": "api_get_product_info", "producedParamName": "productDataSheet", "required": true },
+      "processingMode": { "source": "STATIC", "value": "fast" },
+      "userLanguage": { "source": "SESSION_DATA", "path": "preferences.language", "required": false }
+    }
+    ```
+
+### Sección `authentication` (Opcional)
+
+Si esta API requiere autenticación, esta sección describe cómo obtener y aplicar las credenciales. El sistema (`AuthService`) manejará la obtención, caché y refresco de tokens de forma automática.
+
+-   **`authProfileId` (String, Obligatorio dentro de `authentication`):**
+    -   El ID de un perfil de autenticación definido en un archivo JSON dentro de `config/auth_profiles/`.
+    -   Ejemplo: `"defaultBearerAuth"`
+
+-   **`tokenPlacement` (Objeto, Obligatorio dentro de `authentication`):**
+    -   Describe cómo se debe utilizar el token obtenido del perfil de autenticación en la solicitud HTTP.
+    -   **`in` (String, Obligatorio):** Dónde se coloca el token.
+        -   Valores: `"HEADER"`, `"QUERY_PARAMETER"`.
+    -   **`name` (String, Obligatorio):** El nombre de la cabecera HTTP o del parámetro de query.
+        -   Ejemplo para cabecera: `"Authorization"`
+        -   Ejemplo para query param: `"api_key"`
+    -   **`scheme` (String, Opcional, principalmente para `in: "HEADER"`):** El esquema de autenticación a usar como prefijo del token.
+        -   Ejemplo: `"Bearer"`, `"Token"`. Si está vacío o no se define, solo se usa el valor del token.
+    -   Ejemplo Completo:
+        ```json
+        "authentication": {
+          "authProfileId": "defaultBearerAuth",
+          "tokenPlacement": {
+            "in": "HEADER",
+            "scheme": "Bearer",
+            "name": "Authorization"
+          }
+        }
+        ```
+
+---
+
+## 2. Definición y Uso de Scripts
     ```json
     "consumesParameters": {
       "userIdInUrl": { "source": "USER_INPUT", "aiParamName": "id_document_number", "required": true },
