@@ -265,7 +265,27 @@ function getActionDependencies(action, currentParameters, sessionData, allApiCon
 
 async function executeSingleAction(action, currentParameters, sessionData, sessionId, allApiConfigs) {
     const actionId = action.id;
-    logger.debug({sessionId, actionId, type: action.type, mode:action.executionMode}, "Attempting to execute action");
+    const logPayload = {sessionId, actionId, type: action.type, mode:action.executionMode, label: action.label};
+
+    // 1. Verificar runIfCondition ANTES de cualquier otra cosa
+    if (action.runIfCondition) {
+        const conditionParamPath = action.runIfCondition.paramPath;
+        const conditionExpectedValue = action.runIfCondition.equals; // Asumimos 'equals' por ahora
+        let actualValue;
+        try {
+            actualValue = conditionParamPath.split('.').reduce((o, k) => (o || {})[k], currentParameters);
+        } catch (e) {
+            actualValue = undefined;
+        }
+
+        if (actualValue !== conditionExpectedValue) {
+            logger.debug({...logPayload, conditionPath: conditionParamPath, actualValue, expectedValue: conditionExpectedValue}, "Action skipped due to runIfCondition not met.");
+            return { skipped_conditional: true, conditionNotMet: true };
+        }
+        logger.debug({...logPayload, conditionPath: conditionParamPath, actualValue, expectedValue: conditionExpectedValue}, "runIfCondition met.");
+    }
+
+    logger.debug(logPayload, "Attempting to execute action (post runIfCondition if any)");
 
     let apiConfig;
     if (action.type === "API") {

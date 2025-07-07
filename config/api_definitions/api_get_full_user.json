@@ -20,10 +20,10 @@
       "aiParamName": "id_document_number",
       "required": true
     },
-    "sessionToken": {
-      "source": "SESSION_DATA",
-      "path": "authentication.token",
-      "required": false
+    "sessionToken": { // Renombrado en la plantilla de la API para claridad, pero consume activeApiToken
+      "source": "COLLECTED_PARAM",
+      "paramName": "activeApiToken", // Producido por setActiveTokenScript
+      "required": true // Asumimos que el token ahora es obligatorio para esta API
     }
   }
 }

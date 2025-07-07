@@ -16,7 +16,58 @@
             "executionMode": "ASYNCHRONOUS"
           },
           {
-            "label": "Fetch Full User Profile Async with Wait",
+            "label": "Log Interaction Start",
+            "type": "API",
+            "id": "api_log_interaction_start",
+            "executionMode": "ASYNCHRONOUS"
+          },
+          // --- Inicio Flujo de Token ---
+          {
+            "label": "Ensure API Token is Valid",
+            "type": "SCRIPT", "id": "manageTokenScript",
+            "filePath": "auth/manageToken.js", "functionName": "ensureValidApiToken",
+            "assignResultTo": "tokenStatus",
+            "executionMode": "SYNCHRONOUS",
+            "consumesParameters": {
+              "sessionAuthToken": { "source": "COLLECTED_PARAM", "paramName": "sessionAuthToken", "required": false },
+              "sessionAuthTokenExpiryTimestamp": { "source": "COLLECTED_PARAM", "paramName": "sessionAuthTokenExpiryTimestamp", "required": false }
+            }
+          },
+          {
+            "label": "Generate New API Token if Needed",
+            "type": "API", "id": "api_generate_token",
+            "executionMode": "SYNCHRONOUS",
+            "runIfCondition": { "paramPath": "tokenStatus.output.needsNewToken", "equals": true },
+            "ignoreIfOutputExists": false
+          },
+          {
+            "label": "Cache New Token and Update Session Vars",
+            "type": "SCRIPT", "id": "cacheNewTokenScript",
+            "filePath": "auth/cacheNewToken.js", "functionName": "persistNewToken",
+            "assignResultTo": "cachedTokenState",
+            "executionMode": "SYNCHRONOUS",
+            "runIfCondition": { "paramPath": "tokenStatus.output.needsNewToken", "equals": true },
+            "consumesParameters": {
+              "newAuthToken": { "source": "COLLECTED_PARAM", "paramName": "newAuthToken", "required": true },
+              "newAuthTokenExpiryTimestamp": { "source": "COLLECTED_PARAM", "paramName": "newAuthTokenExpiryTimestamp", "required": false },
+              "newAuthTokenExpiresIn": { "source": "COLLECTED_PARAM", "paramName": "newAuthTokenExpiresIn", "required": false }
+            }
+          },
+          {
+            "label": "Set Active Token for Subsequent Calls",
+            "type": "SCRIPT", "id": "setActiveTokenScript",
+            "filePath": "auth/setActiveToken.js", "functionName": "determineActiveToken",
+            "assignResultTo": "activeApiToken",
+            "executionMode": "SYNCHRONOUS",
+            "consumesParameters": {
+                "tokenStatusOutput": {"source":"COLLECTED_PARAM", "paramName":"tokenStatus.output", "required":false},
+                "cachedTokenStateOutput": {"source":"COLLECTED_PARAM", "paramName":"cachedTokenState.output", "required":false},
+                "generatedToken": {"source":"COLLECTED_PARAM", "paramName":"newAuthToken", "required":false}
+            }
+          },
+          // --- Fin Flujo de Token ---
+          {
+            "label": "Fetch Full User Profile", // Nombre original, no "Async with Wait"
             "type": "API",
             "id": "api_get_full_user",
             "executionMode": "ASYNCHRONOUS",
