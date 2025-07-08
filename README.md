@@ -21,10 +21,20 @@ Este proyecto implementa una Máquina de Estados Finitos (FSM) en Node.js, con p
 *   **Consumo de Respuestas Asíncronas (Redis Streams)**:
     *   `src/index.js` (`handleInputWithAI`): Antes de llamar a la IA, verifica y consume mensajes de los Redis Streams pendientes (usando `XREADGROUP`).
     *   Datos/errores de estas APIs se fusionan con el input del usuario para la IA (contexto `[API Response Context ...]`) y en `collectedParameters.async_api_results.{apiId}`.
-*   **Motor FSM Configurable**: Lógica en `config/states.json`.
-*   **Plantillas Dinámicas**: `payloadResponse` y `customInstructions` para IA procesadas por `templateProcessor.js` (pueden usar `{{sync_api_results...}}` y `{{async_api_results...}}`).
-*   **Persistencia (Redis)**: Sesiones FSM (incl. `sync_api_results`, `pendingApiResponses`), logs.
-*   **Interfaces**: API RESTful, Sockets UNIX, Asterisk ARI.
+*   **Motor FSM Avanzado y Configurable**:
+    *   Lógica principal en `config/states.json`.
+    *   **Manejo de Estados Saltados**: Capacidad de ejecutar acciones (APIs, scripts) de estados intermedios omitidos si el usuario provee información adelantada.
+    *   **Dependencias Configurables**: Las llamadas API y ejecución de scripts pueden definir dependencias de parámetros de usuario o resultados de otras APIs.
+*   **Ejecución de Snippets de Código JS**:
+    *   Permite ejecutar piezas de código JavaScript personalizadas (`config/scripts/`) como parte del flujo de un estado.
+    *   Configurable en `config/states.json` bajo `payloadResponse.apiHooks.executeScript`.
+    *   Resultados pueden ser asignados a parámetros de la conversación.
+*   **Plantillas Dinámicas**: `payloadResponse` y `customInstructions` para IA procesadas por `templateProcessor.js` (pueden usar `{{sync_api_results...}}`, `{{async_api_results...}}`, `{{script_results...}}`).
+*   **Persistencia (Redis) Mejorada**:
+    *   Sesiones FSM (incl. `sync_api_results`, `pendingApiResponses`, `script_results`, historial de conversación).
+    *   Expiración de sesiones configurada mediante `REDIS_SESSION_TTL`.
+    *   Control de tamaño de streams (usando `MAXLEN`) en el script simulador de respuestas API (`SIMULATOR_STREAM_MAXLEN`).
+*   **Interfaces**: API RESTful, Sockets UNIX, Asterisk ARI (ver `docs/ARI_Integration.md`).
 *   **Logging**: `pino`.
 *   **Definiciones de API**: En `config/api_definitions/` (URL, método, headers, plantillas, timeouts).
 

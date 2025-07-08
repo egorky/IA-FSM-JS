@@ -9,7 +9,8 @@ const { startSocketServer, stopSocketServer } = require('./socketServer');
 const redisClient = require('./redisClient');
 const { connectAri, closeAri } = require('./ariClient');
 const fsm = require('./fsm'); // Contains FSM_SESSION_PREFIX, initializeOrRestoreSession, processInput, saveSessionAsync
-const { loadStateConfig, getStateById } = require('./configLoader'); // getStateById might be useful
+const { loadStateConfig, getStateById } = require('./configLoader');
+const { processTemplate } = require('./templateProcessor'); // Added templateProcessor
 const aiService = require('./aiService');
 const jsonValidator = require('./jsonValidator');
 const { validateAIResponse: customAIResponseValidator } = require('../config/customAIResponseValidator');
@@ -46,10 +47,105 @@ async function ensureStreamGroupExists(streamKey, groupName) {
     }
 }
 
+// Importar getApiConfigById para usarlo en processStreamResponsesAndUpdateContext
+const { getApiConfigById: getAllApiConfigs } = require('./apiConfigLoader');
+
+
+async function processStreamResponsesAndUpdateContext(sessionId, sessionData, currentParameters) {
+    let fullTextUpdateForAI = '';
+    let sessionModified = false;
+    const allApiConfigs = getAllApiConfigs(); // Cargar todas las configs de API una vez
+
+    const pendingResponsesToEvaluate = { ...sessionData.pendingApiResponses };
+
+    for (const correlationId in pendingResponsesToEvaluate) {
+        const pendingInfo = sessionData.pendingApiResponses[correlationId];
+        if (!pendingInfo) continue;
+
+        if (pendingInfo.waitForResultConfig && pendingInfo.waitForResultConfig.point === "BEFORE_AI_PROMPT_NEXT_TURN") {
+            logger.info({ sessionId, correlationId, apiId: pendingInfo.apiId, streamKey: pendingInfo.responseStreamKey },
+                `Actively waiting for stream response (Point: BEFORE_AI_PROMPT_NEXT_TURN).`);
+
+            const timeoutMs = pendingInfo.waitForResultConfig.timeoutMs || parseInt(process.env.DEFAULT_ASYNC_WAIT_TIMEOUT_MS, 10) || 7000;
+            let apiMessageData = null;
+            let streamReadStatus = 'error';
+
+            try {
+                await ensureStreamGroupExists(pendingInfo.responseStreamKey, CONSUMER_GROUP_NAME);
+                const streamResult = await redisClient.xreadgroup(
+                    CONSUMER_GROUP_NAME,
+                    `${CONSUMER_NAME_PREFIX}:${sessionId}:${correlationId}`,
+                    [pendingInfo.responseStreamKey, '>'],
+                    timeoutMs, 1
+                );
+
+                if (streamResult && streamResult.length > 0 && streamResult[0][1].length > 0) {
+                    const messageId = streamResult[0][1][0][0];
+                    const messageFields = streamResult[0][1][0][1];
+                    apiMessageData = {};
+                    for (let i = 0; i < messageFields.length; i += 2) {
+                        try { apiMessageData[messageFields[i]] = JSON.parse(messageFields[i+1]); }
+                        catch (e) { apiMessageData[messageFields[i]] = messageFields[i+1]; }
+                    }
+                    streamReadStatus = apiMessageData.status || 'error';
+                    logger.info({ sessionId, correlationId, apiId: pendingInfo.apiId, status: streamReadStatus }, 'Retrieved actively awaited API response from stream.');
+                    await redisClient.xack(pendingInfo.responseStreamKey, CONSUMER_GROUP_NAME, messageId);
+                } else {
+                    streamReadStatus = 'timeout_wait';
+                    logger.warn({sessionId, correlationId, apiId: pendingInfo.apiId, streamKey: pendingInfo.responseStreamKey, timeoutMs}, "Timed out waiting for actively awaited API response.");
+                }
+            } catch (err) {
+                logger.error({ err, sessionId, correlationId, apiId: pendingInfo.apiId, streamKey: pendingInfo.responseStreamKey }, 'Error during active wait/read from stream.');
+                streamReadStatus = 'system_error_wait';
+            }
+
+            const apiDef = allApiConfigs[pendingInfo.apiId];
+            const contextMarker = pendingInfo.apiId || 'UNKNOWN_API';
+            const asyncNamespace = `async_api_results_${contextMarker}`; // Consistente con checkNonAwaited
+
+            if (streamReadStatus === 'success' && apiMessageData && apiMessageData.data !== undefined) {
+                fullTextUpdateForAI += `\n\n[API Response Context for '${contextMarker}' (ID: ${correlationId}): ${JSON.stringify(apiMessageData.data)}]`;
+                currentParameters[asyncNamespace] = { status: 'success', data: apiMessageData.data, httpCode: apiMessageData.httpCode };
+                if (apiDef && apiDef.producesParameters) {
+                    for (const standardName in apiDef.producesParameters) {
+                        const path = apiDef.producesParameters[standardName];
+                        let value;
+                        try { value = path.split('.').reduce((o, k) => (o || {})[k], apiMessageData); } // apiMessageData ya tiene 'data' en su interior si es exitoso
+                        catch(e){ value = undefined; }
+                        if (value !== undefined) currentParameters[standardName] = value;
+                         else logger.warn({sessionId, apiId: pendingInfo.apiId, standardName, path, responseData: apiMessageData}, "Could not map producedParameter from awaited API response.");
+                    }
+                }
+            } else if (streamReadStatus === 'timeout_wait' && pendingInfo.waitForResultConfig.onTimeoutFallback?.mapToProducesParameters) {
+                const fallbackParams = pendingInfo.waitForResultConfig.onTimeoutFallback.mapToProducesParameters;
+                fullTextUpdateForAI += `\n\n[API Fallback Context for '${contextMarker}' (ID: ${correlationId}): Timeout, using fallback: ${JSON.stringify(fallbackParams)}]`;
+                currentParameters[asyncNamespace] = { status: 'timeout', fallback_applied: true, data: fallbackParams };
+                for (const paramName in fallbackParams) {
+                    currentParameters[paramName] = fallbackParams[paramName];
+                }
+            } else {
+                const errorMessage = apiMessageData?.errorMessage || streamReadStatus;
+                fullTextUpdateForAI += `\n\n[API Error Context for '${contextMarker}' (ID: ${correlationId}): ${errorMessage}]`;
+                currentParameters[asyncNamespace] = { status: 'error', message: errorMessage, data: apiMessageData?.data, httpCode: apiMessageData?.httpCode };
+            }
+            delete sessionData.pendingApiResponses[correlationId];
+            sessionModified = true;
+        }
+    }
+    return { fullTextUpdateForAI, sessionModified };
+}
+
+
 // This function processes ONE specific pending API response from a stream if specified by waitForCorrelationId
-async function processSingleAwaitedApiResponse(sessionId, sessionData, waitForCorrelationId, currentParameters, fullTextInputForAI) {
-    const pendingInfo = sessionData.pendingApiResponses[waitForCorrelationId];
-    logger.info({sessionId, correlationId: waitForCorrelationId, streamKey: pendingInfo.responseStreamKey}, `Explicitly waiting for API response on stream.`);
+// ESTA FUNCIÓN (processSingleAwaitedApiResponse) SERÁ REEMPLAZADA/OBSOLETADA por la lógica en processStreamResponsesAndUpdateContext
+// y la llamada explícita a ella más abajo. La comentaremos o eliminaremos después.
+async function processSingleAwaitedApiResponse(sessionId, sessionData, waitForCorrelationId, currentParameters/*, fullTextInputForAI - ya no lo modifica directamente*/) {
+    const pendingInfo = sessionData.pendingApiResponses[waitForCorrelationId]; // CUIDADO: Esta función asume que pendingInfo existe.
+    if (!pendingInfo) {
+        logger.warn({sessionId, waitForCorrelationId}, "processSingleAwaitedApiResponse called for a non-existent pending response.");
+        return { textUpdate: '', newParameters: {} };
+    }
+    logger.info({sessionId, correlationId: waitForCorrelationId, streamKey: pendingInfo.responseStreamKey}, `Explicitly waiting for API response on stream (legacy call).`);
     await ensureStreamGroupExists(pendingInfo.responseStreamKey, CONSUMER_GROUP_NAME);
 
     let newParametersFromThisApi = {};
@@ -170,27 +266,105 @@ async function handleInputWithAI(sessionId, clientInput, source) {
 
   let sessionData = await fsm.initializeOrRestoreSession(sessionId);
   let currentParameters = { ...sessionData.parameters };
-  let fullTextInputForAI = userInputText;
+  let baseUserInputForAI = userInputText; // Input original del usuario para este turno
+  let contextFromStreams = ''; // Contexto de APIs asíncronas esperadas
+  let sessionModifiedByAsync = false;
 
-  // Process explicitly awaited API response first
-  if (waitForCorrelationId && sessionData.pendingApiResponses && sessionData.pendingApiResponses[waitForCorrelationId]) {
-    const { textUpdate, newParameters } = await processSingleAwaitedApiResponse(sessionId, sessionData, waitForCorrelationId, currentParameters, fullTextInputForAI);
-    fullTextInputForAI += textUpdate;
-    currentParameters = { ...currentParameters, ...newParameters };
-    // sessionData.pendingApiResponses was modified in processSingleAwaitedApiResponse
+  // --- Procesar respuestas de stream que se deben esperar ANTES del prompt de IA ---
+  if (sessionData.pendingApiResponses && Object.keys(sessionData.pendingApiResponses).length > 0) {
+    const streamProcessingResult = await processStreamResponsesAndUpdateContext(sessionId, sessionData, currentParameters);
+    contextFromStreams = streamProcessingResult.fullTextUpdateForAI;
+    if (streamProcessingResult.sessionModified) {
+      sessionModifiedByAsync = true;
+      // currentParameters fue modificado por referencia dentro de processStreamResponsesAndUpdateContext
+    }
+  }
+  // En este punto, sessionData.pendingApiResponses ha sido limpiado de las que se esperaron.
+  // currentParameters está actualizado con resultados de esas APIs o sus fallbacks.
+
+  // Construir el fullTextInputForAI para la IA
+  let fullTextInputForAI = "";
+  const currentStateId = sessionData.currentStateId;
+  const stateConfig = getStateById(currentStateId);
+  const currentStateId = sessionData.currentStateId;
+  const stateConfig = getStateById(currentStateId);
+  let renderedCustomInstructions = "";
+
+  if (stateConfig && stateConfig.payloadResponse && stateConfig.payloadResponse.customInstructions) {
+    try {
+      // Render customInstructions using parameters available *before* this turn's sync operations
+      // These are parameters from the session, including async_api_results from previous turns.
+      renderedCustomInstructions = processTemplate(
+        stateConfig.payloadResponse.customInstructions,
+        currentParameters // Use parameters as they are at this point
+      );
+      logger.debug({ sessionId, currentStateId, renderedCustomInstructions }, "Rendered customInstructions for AI prompt.");
+    } catch (templateError) {
+      logger.error({ err: templateError, sessionId, currentStateId }, "Error rendering customInstructions for AI prompt.");
+    }
   }
 
-  // Process any other non-awaited pending responses
-  const { textUpdate: otherTextUpdates, newParameters: otherNewParams } = await checkNonAwaitedApiResponses(sessionId, sessionData, currentParameters);
-  fullTextInputForAI += otherTextUpdates;
-  currentParameters = { ...currentParameters, ...otherNewParams };
+  // Prepend custom instructions
+  // Prepend custom instructions
+  if (renderedCustomInstructions) {
+    fullTextInputForAI += `State Instructions: "${renderedCustomInstructions}"\n\n`;
+  }
+  // Prepend context from actively awaited streams
+  if (contextFromStreams) {
+    fullTextInputForAI += `${contextFromStreams}\n\n`;
+  }
 
-  sessionData.parameters = currentParameters; // Update session with params from API responses
-  // Save session if pendingApiResponses changed or new API params were added
-  if (Object.keys(sessionData.pendingApiResponses).length < Object.keys(clientInput.pendingApiResponses || {}).length || Object.keys(otherNewParams).length > 0) {
+  // Añadir Historial de Conversación (si existe)
+  if (sessionData.conversationHistory && sessionData.conversationHistory.length > 0) {
+    const formattedHistory = sessionData.conversationHistory
+      .map(turn => `User: ${turn.userInput}\nAI: ${turn.aiOutput}`)
+      .join('\n\n'); // Doble salto de línea entre turnos completos
+    fullTextInputForAI = `Previous Conversation History:\n${formattedHistory}\n\n${fullTextInputForAI}`;
+    // OJO: Poner el historial antes podría ser muy largo. Considerar si va antes o después del input actual.
+    // Por ahora, lo pongo antes, pero después de custom instructions y context de streams.
+  }
+
+  // Añadir Parámetros Recolectados (filtrados)
+  const cleanParametersForAI = { ...currentParameters };
+  delete cleanParametersForAI.sync_api_results;   // No enviar resultados crudos de API síncronas
+  delete cleanParametersForAI.script_results;     // No enviar resultados crudos de scripts
+  // async_api_results ya se manejan como contexto textual o se mapean a parámetros directos.
+  // Eliminar también los que ya se mapearon para no ser redundantes, si es posible identificar.
+  // Por ahora, una limpieza simple:
+  for (const key in cleanParametersForAI) {
+    if (key.startsWith('async_api_results_')) { // Eliminar los namespaces crudos de async
+        delete cleanParametersForAI[key];
+    }
+  }
+
+  if (Object.keys(cleanParametersForAI).length > 0) {
+    try {
+      const collectedParamsString = JSON.stringify(cleanParametersForAI);
+      fullTextInputForAI = `[Currently Known Parameters: ${collectedParamsString}]\n\n${fullTextInputForAI}`;
+    } catch (e) {
+      logger.warn({sessionId, err: e}, "Could not stringify cleanParametersForAI for AI prompt.");
+    }
+  }
+
+  // Finalmente, el input del usuario para este turno
+  fullTextInputForAI += `Current User Input: "${baseUserInputForAI}"`;
+
+
+  // Procesar las APIs asíncronas restantes que NO se esperaron activamente para el prompt de IA.
+  // Estas actualizarán currentParameters para la FSM, pero su texto no se añade a fullTextInputForAI.
+  const nonAwaitedProcessing = await checkNonAwaitedApiResponses(sessionId, sessionData, currentParameters);
+  if (Object.keys(nonAwaitedProcessing.newParameters).length > 0) {
+    currentParameters = { ...currentParameters, ...nonAwaitedProcessing.newParameters };
+    sessionModifiedByAsync = true; // Marcamos que la sesión cambió
+  }
+  // `checkNonAwaitedApiResponses` ya borra de `sessionData.pendingApiResponses` las que procesa.
+
+  sessionData.parameters = currentParameters; // Asegurar que currentParameters (con todos los resultados de streams) esté en sessionData
+
+  if (sessionModifiedByAsync) {
+      logger.info({sessionId}, "Session modified by async API response processing (waited or non-waited). Saving session before AI call.");
       fsm.saveSessionAsync(`${fsm.FSM_SESSION_PREFIX}${sessionId}`, sessionData, parseInt(process.env.REDIS_SESSION_TTL, 10));
   }
-
 
   // --- AI Processing ---
   let aiIntent, aiParameters;
@@ -214,7 +388,8 @@ async function handleInputWithAI(sessionId, clientInput, source) {
   } else {
     redisClient.set(`ai_actual_input:${sessionId}:${Date.now()}`, JSON.stringify({ textForAI: fullTextInputForAI }), 'EX', 3600).catch(err => logger.error({ err, sessionId }, 'Log ai_actual_input failed'));
     try {
-      const aiJsonResponse = await aiService.getAIResponse(fullTextInputForAI, aiPromptContent);
+      // Pass sessionId to getAIResponse for enhanced logging in aiService
+      const aiJsonResponse = await aiService.getAIResponse(fullTextInputForAI, aiPromptContent, sessionId);
       const schemaValidationResult = jsonValidator.validateJson(aiJsonResponse);
       if (!schemaValidationResult.isValid) {
         logger.warn({ sessionId, errors: schemaValidationResult.errors, aiResponse: aiJsonResponse }, 'AI response schema validation failed.');
@@ -250,8 +425,37 @@ async function handleInputWithAI(sessionId, clientInput, source) {
 
   // Pass all current parameters (session + input + async API results) to FSM
   // FSM will then handle its synchronous APIs and merge results into these.
-  const fsmResult = await fsm.processInput(sessionId, aiIntent, aiParameters, initialCall);
-  // fsm.processInput now handles saving the final sessionData itself.
+  const fsmResult = await fsm.processInput(sessionId, aiIntent, aiParameters, initialCall, baseUserInputForAI /* Pasar userInputText */);
+
+  // --- Poblar Historial de Conversación ---
+  if (fsmResult && fsmResult.payloadResponse?.prompts?.main) {
+    if (!sessionData.conversationHistory) { // Doble chequeo, aunque initializeOrRestoreSession debería hacerlo
+      sessionData.conversationHistory = [];
+    }
+    sessionData.conversationHistory.push({
+      userInput: baseUserInputForAI, // El input original del usuario para este turno
+      aiOutput: fsmResult.payloadResponse.prompts.main, // La respuesta principal que se le da al usuario
+      intent: aiIntent, // Guardar el intent detectado por la IA para este turno
+      parametersFromAI: aiParameters, // Guardar los parámetros extraídos por la IA
+      timestamp: new Date().toISOString()
+    });
+
+    const MAX_HISTORY_TURNS = parseInt(process.env.CONVERSATION_HISTORY_MAX_TURNS, 10) || 10; // Default 10 turnos
+    if (sessionData.conversationHistory.length > MAX_HISTORY_TURNS) {
+      sessionData.conversationHistory.splice(0, sessionData.conversationHistory.length - MAX_HISTORY_TURNS);
+    }
+    // Guardar la sesión FSM actualizada con el nuevo historial
+    // fsm.processInput ya guarda la sesión al final de su ejecución.
+    // Si queremos asegurar que el historial se guarde *después* de que fsm.processInput guardó,
+    // podríamos llamar a saveSessionAsync aquí de nuevo. O fsm.processInput podría devolver la sessionData actualizada
+    // y la guardamos aquí.
+    // Por ahora, asumimos que fsm.processInput guardó la sesión SIN este último historial.
+    // Así que es necesario un guardado adicional aquí para el historial.
+    fsm.saveSessionAsync(`${fsm.FSM_SESSION_PREFIX}${sessionId}`, sessionData, parseInt(process.env.REDIS_SESSION_TTL, 10));
+    logger.debug({sessionId, historyLength: sessionData.conversationHistory.length}, "Conversation history updated and session saved.");
+  }
+  // --- Fin Poblar Historial ---
+
 
   redisClient.set(`fsm_output:${sessionId}:${Date.now()}`, JSON.stringify(fsmResult), 'EX', 3600)
     .catch(err => logger.error({ err, sessionId }, 'Failed to log fsm_output to Redis'));

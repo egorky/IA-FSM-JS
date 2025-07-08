@@ -1,0 +1,17 @@
+{
+  "authProfileId": "defaultBearerAuth",
+  "description": "Perfil de autenticación estándar usando Bearer Token obtenido de una API dedicada.",
+  "authStrategy": "BEARER_TOKEN_FROM_API",
+  "tokenGenerationDetails": {
+    "apiId": "api_generate_system_token",
+    "producesAuthData": {
+      "tokenValue": "data.access_token",
+      "expiresInSeconds": "data.expires_in",
+      "tokenType": "data.token_type"
+    }
+  },
+  "tokenCacheSettings": {
+    "redisKey": "auth_token_cache:default_bearer",
+    "refreshBufferSeconds": 300
+  }
+}

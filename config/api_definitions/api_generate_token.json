@@ -1,0 +1,44 @@
+{
+  "apiId": "api_generate_token",
+  "description": "Obtiene un nuevo token de autenticación del servidor de autorización.",
+  "url_template": "https://auth.example.com/oauth/token",
+  "method": "POST",
+  "headers_template": {
+    "Content-Type": "application/x-www-form-urlencoded"
+    // O "application/json" dependiendo del servidor de autenticación
+  },
+  "body_template": { // Ejemplo para x-www-form-urlencoded; ajustar si es JSON
+    "grant_type": "{{params.grantType}}", // ej. "client_credentials"
+    "client_id": "{{params.clientId}}",
+    "client_secret": "{{params.clientSecret}}"
+    // "scope": "{{params.scope}}" // opcional
+  },
+  "timeout_ms": 5000,
+  "producesParameters": {
+    "newAuthToken": "data.access_token", // Asumiendo que la respuesta JSON tiene { "access_token": "...", "expires_in": 3600, ... }
+    "newAuthTokenExpiresIn": "data.expires_in", // Duración en segundos
+    "newAuthTokenType": "data.token_type" // ej. "Bearer"
+    // Nota: 'newAuthTokenExpiryTimestamp' (timestamp absoluto) es más útil.
+    // El script 'cacheNewToken.js' podría calcularlo a partir de 'newAuthTokenExpiresIn'.
+    // O, si la API devuelve un timestamp absoluto, mapearlo directamente.
+    // Vamos a asumir que el script lo calculará si solo se da 'expires_in'.
+  },
+  "consumesParameters": {
+    "grantType": {
+      "source": "STATIC",
+      "value": "client_credentials",
+      "required": true
+    },
+    "clientId": {
+      "source": "STATIC", // O podrían venir de un gestor de secretos / env vars
+      "value": "YOUR_CLIENT_ID", // REEMPLAZAR CON VALOR REAL o plantilla a secrets
+      "required": true
+    },
+    "clientSecret": {
+      "source": "STATIC",
+      "value": "YOUR_CLIENT_SECRET", // REEMPLAZAR CON VALOR REAL o plantilla a secrets
+      "required": true
+    }
+    // "scope": { "source": "STATIC", "value": "read write", "required": false }
+  }
+}

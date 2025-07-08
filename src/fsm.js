@@ -1,32 +1,179 @@
-const { getStateById, getInitialStateId } = require('./configLoader');
-const redisClient = require('./redisClient');
+const { getStateById, getInitialStateId, getAllStates: getAllStatesConfig } = require('./configLoader');
+const { getApiConfigById } = require('./apiConfigLoader');
+const apiCallerService = require('./apiCallerService');
+const scriptExecutor = require('./scriptExecutor');
 const { processTemplate } = require('./templateProcessor');
+const redisClient = require('./redisClient');
 const logger = require('./logger');
 const { v4: uuidv4 } = require('uuid');
-const apiCallerService = require('./apiCallerService');
-const { getApiConfigById } = require('./apiConfigLoader');
 
 const FSM_SESSION_PREFIX = 'fsm_session:';
 
-function saveSessionAsync(sessionKey, sessionData, sessionTTL) {
-  const jsonData = JSON.stringify(sessionData);
-  let promise = redisClient.set(sessionKey, jsonData); // Default no TTL
-  if (sessionTTL && sessionTTL > 0) {
-    promise = redisClient.set(sessionKey, jsonData, 'EX', sessionTTL);
+// --- Funciones Auxiliares ---
+function extractTemplateParams(templateString) {
+  if (!templateString || typeof templateString !== 'string') {
+    return [];
   }
-  promise.catch(err => {
-    logger.error({ err, sessionId: sessionKey.split(':')[1] }, 'FSM session failed to save to Redis.');
-  });
+  const regex = /\{\{([\w.-]+)\}\}/g; // Captura nombre de parámetro dentro de {{...}}
+  const params = new Set();
+  let match;
+  while ((match = regex.exec(templateString)) !== null) {
+    params.add(match[1]);
+  }
+  return Array.from(params);
 }
 
+/**
+ * Construye un grafo de dependencias para acciones síncronas.
+ * @param {Array<Object>} syncTasks - Array de objetos de tarea (acciones síncronas del masterActionPlan).
+ * @param {Object} currentParameters - Parámetros actualmente disponibles.
+ * @param {Object} sessionData - Datos completos de la sesión actual.
+ * @param {Object} allApiConfigs - Mapa de todas las configuraciones de API.
+ * @param {String} sessionId - ID de la sesión.
+ * @returns {Object} { graph: { adj: Map<string, Array<string>>, inDegree: Map<string, number> }, taskMap: Map<string, Object>, unresolvedTasks: Array<Object> }
+ */
+function buildSyncActionGraph(syncTasks, currentParameters, sessionData, allApiConfigs, sessionId) {
+    const graph = { adj: new Map(), inDegree: new Map() };
+    const taskMap = new Map(); // Mapea task.uniqueId -> taskObject
+    const taskProducesMap = new Map(); // Mapea paramName -> task.uniqueId que lo produce (solo síncronos)
+    let unresolvedTasks = []; // Tareas que no se pueden ejecutar por dependencias USER_INPUT faltantes desde el inicio
+
+    // Inicializar grafo y taskMap, y registrar qué parámetros produce cada tarea síncrona
+    syncTasks.forEach((task, index) => {
+        // Crear un uniqueId para cada tarea en este plan específico, ya que una misma API/Script puede ser llamada varias veces
+        // o aparecer en diferentes contextos (ej. estado saltado vs estado actual)
+        // Si la tarea ya tiene un uniqueId (ej. si masterActionPlan ya los genera), se puede usar ese.
+        // Por ahora, generamos uno basado en su posición en la lista de tareas síncronas.
+        const uniqueTaskId = task.uniqueId || `${task.type}_${task.id}_sync_${index}`;
+        task.uniqueId = uniqueTaskId; // Asegurar que la tarea tenga este ID para referencia
+
+        taskMap.set(uniqueTaskId, task);
+        graph.adj.set(uniqueTaskId, []);
+        graph.inDegree.set(uniqueTaskId, 0);
+
+        if (task.executionMode === "SYNCHRONOUS") { // Solo nos interesan las productoras síncronas para este grafo
+            if (task.type === "API") {
+                const apiConfig = allApiConfigs[task.id];
+                if (apiConfig && apiConfig.producesParameters) {
+                    Object.keys(apiConfig.producesParameters).forEach(producedParam => {
+                        if (taskProducesMap.has(producedParam) && taskProducesMap.get(producedParam) !== uniqueTaskId) {
+                            logger.warn({sessionId, producedParam, existingProducer: taskProducesMap.get(producedParam), newProducer: uniqueTaskId }, "Multiple synchronous actions in plan produce the same parameter. Dependency graph will use the first encountered producer.");
+                        }
+                        if (!taskProducesMap.has(producedParam)) {
+                            taskProducesMap.set(producedParam, uniqueTaskId);
+                        }
+                    });
+                }
+            } else if (task.type === "SCRIPT" && task.assignResultTo) {
+                 if (taskProducesMap.has(task.assignResultTo) && taskProducesMap.get(task.assignResultTo) !== uniqueTaskId) {
+                    logger.warn({sessionId, producedParam: task.assignResultTo, existingProducer: taskProducesMap.get(task.assignResultTo), newProducer: uniqueTaskId }, "Multiple synchronous actions (script) in plan produce the same parameter. Dependency graph will use the first encountered producer.");
+                }
+                if (!taskProducesMap.has(task.assignResultTo)) {
+                    taskProducesMap.set(task.assignResultTo, uniqueTaskId);
+                }
+            }
+        }
+    });
+
+    // Construir aristas basadas en dependencias
+    taskMap.forEach((task, uniqueTaskId) => {
+        let taskConsumesDef;
+        if (task.type === "API") taskConsumesDef = allApiConfigs[task.id]?.consumesParameters;
+        else if (task.type === "SCRIPT") taskConsumesDef = task.consumesParameters; // Asumiendo que los scripts lo definen igual
+
+        if (taskConsumesDef) {
+            for (const templateParamName in taskConsumesDef) {
+                const pDef = taskConsumesDef[templateParamName];
+                if (pDef.source === "API_RESULT" || pDef.source === "SCRIPT_RESULT") {
+                    const producerParamName = pDef.producedParamName; // Nombre estandarizado del parámetro producido
+                    const producerTaskUniqueId = taskProducesMap.get(producerParamName);
+
+                    if (producerTaskUniqueId && producerTaskUniqueId !== uniqueTaskId) {
+                        // Añadir arista: producerTaskUniqueId -> uniqueTaskId
+                        graph.adj.get(producerTaskUniqueId).push(uniqueTaskId);
+                        graph.inDegree.set(uniqueTaskId, (graph.inDegree.get(uniqueTaskId) || 0) + 1);
+                    } else if (!currentParameters.hasOwnProperty(producerParamName) && pDef.required !== false) {
+                        // Depende de un resultado de API/Script que no está en el plan síncrono actual ni en currentParameters
+                        // Esto podría hacer que la tarea sea irresoluble si la dependencia es crítica.
+                        // El ordenamiento topológico maneja esto: si su inDegree no llega a 0, no se ejecuta.
+                         logger.warn({sessionId, taskId: uniqueTaskId, actionId: task.id, missingParam: producerParamName, fromSource: pDef.source}, "Task depends on an external or async API/Script result not yet available or planned sychronously.");
+                    }
+                }
+            }
+        }
+    });
+
+    // Identificar tareas que son irresolubles desde el inicio por USER_INPUT faltante
+    // y que no tienen dependencias entrantes (inDegree === 0)
+    taskMap.forEach((task, uniqueTaskId) => {
+        if (graph.inDegree.get(uniqueTaskId) === 0) { // No depende de otras tareas síncronas del plan
+            const { met, missing } = getActionDependencies(task, currentParameters, sessionData, allApiConfigs);
+            if (!met && missing.some(m => m.includes("USER_INPUT") || m.includes("expected from AI as"))) {
+                unresolvedTasks.push({...task, reason: "Missing initial USER_INPUT and no preceding sync tasks to provide it.", missingDeps: missing});
+            }
+        }
+    });
+    return { graph, taskMap, unresolvedTasks };
+}
+
+/**
+ * Realiza un ordenamiento topológico (Algoritmo de Kahn).
+ * @param {Object} graph - El grafo con { adj: Map<string, Array<string>>, inDegree: Map<string, number> }.
+ * @param {Map<string, Object>} taskMap - Mapa de task.uniqueId a objeto de tarea.
+ * @param {Array<Object>} unresolvedTasksOnInit - Tareas ya marcadas como irresolubles.
+ * @returns {Array<Object>|null} Array ordenado de objetos de tarea, o null si hay un ciclo.
+ */
+function topologicalSort(graph, taskMap, unresolvedTasksOnInit) {
+    const sortedOrder = [];
+    const queue = [];
+    const inDegree = new Map(graph.inDegree); // Copiar para modificar
+
+    const unresolvedOnInitIds = new Set(unresolvedTasksOnInit.map(t => t.uniqueId));
+
+    taskMap.forEach((task, uniqueTaskId) => {
+        if (inDegree.get(uniqueTaskId) === 0 && !unresolvedOnInitIds.has(uniqueTaskId)) {
+            queue.push(uniqueTaskId);
+        }
+    });
+
+    while (queue.length > 0) {
+        const u_uniqueId = queue.shift();
+        sortedOrder.push(taskMap.get(u_uniqueId));
+
+        (graph.adj.get(u_uniqueId) || []).forEach(v_uniqueId => {
+            inDegree.set(v_uniqueId, inDegree.get(v_uniqueId) - 1);
+            if (inDegree.get(v_uniqueId) === 0 && !unresolvedOnInitIds.has(v_uniqueId)) {
+                queue.push(v_uniqueId);
+            }
+        });
+    }
+
+    if (sortedOrder.length !== (taskMap.size - unresolvedOnInitIds.size)) {
+        const cycleOrUnresolvedTasks = [];
+        taskMap.forEach((task, uniqueTaskId) => {
+            if (!unresolvedOnInitIds.has(uniqueTaskId) && !sortedOrder.some(st => st.uniqueId === uniqueTaskId)) {
+                cycleOrUnresolvedTasks.push(task.id + (task.label ? ` (${task.label})` : '') + ` (InDegree: ${inDegree.get(uniqueTaskId)})`);
+            }
+        });
+        logger.error({ detectedCycleOrUnresolved: cycleOrUnresolvedTasks, details: {sortedCount: sortedOrder.length, mapSize: taskMap.size, unresolvedOnInitCount: unresolvedOnInitIds.size} },
+            "Cycle detected or unresolved dependencies in synchronous actions. Not all tasks could be sorted.");
+        return null;
+    }
+    return sortedOrder;
+}
+
+
+// --- Funciones de Sesión ---
 async function initializeOrRestoreSession(sessionId) {
   const sessionKey = `${FSM_SESSION_PREFIX}${sessionId}`;
   let sessionDataString = await redisClient.get(sessionKey);
   if (sessionDataString) {
     const session = JSON.parse(sessionDataString);
-    session.pendingApiResponses = session.pendingApiResponses || {};
-    session.sync_api_results = session.sync_api_results || {}; // Initialize if not present
     session.parameters = session.parameters || {};
+    session.pendingApiResponses = session.pendingApiResponses || {};
+    session.sync_api_results = session.sync_api_results || {};
+    session.script_results = session.script_results || {};
+    session.conversationHistory = session.conversationHistory || [];
     logger.debug({ sessionId }, 'FSM session restored from Redis.');
     return session;
   } else {
@@ -35,240 +182,490 @@ async function initializeOrRestoreSession(sessionId) {
       currentStateId: initialStateId,
       parameters: {},
       history: [initialStateId],
+      conversationHistory: [],
       pendingApiResponses: {},
-      sync_api_results: {}, // Initialize for new sessions
+      sync_api_results: {},
+      script_results: {},
     };
-    const sessionTTL = parseInt(process.env.REDIS_SESSION_TTL, 10);
-    saveSessionAsync(sessionKey, initialSession, sessionTTL);
+    saveSessionAsync(sessionKey, initialSession);
     logger.info({ sessionId, initialStateId }, 'FSM new session initialized.');
     return initialSession;
   }
 }
 
-async function processInput(sessionId, intent, inputParameters = {}, initialCall = false) {
-  const sessionKey = `${FSM_SESSION_PREFIX}${sessionId}`;
-  let sessionData = await initializeOrRestoreSession(sessionId);
-  let currentStateId = sessionData.currentStateId;
+function saveSessionAsync(sessionKey, sessionData, sessionTTL) {
+  const jsonData = JSON.stringify(sessionData);
+  const effectiveTTL = (sessionTTL && sessionTTL > 0) ? sessionTTL : (parseInt(process.env.REDIS_SESSION_TTL, 10) || 3600);
+  redisClient.set(sessionKey, jsonData, 'EX', effectiveTTL)
+    .catch(err => logger.error({ err, sessionId: sessionKey.split(':')[1] }, 'FSM session failed to save to Redis.'));
+}
 
-  // Merge incoming parameters and ensure session.parameters is the single source of truth for currentParameters
-  let currentParameters = { ...sessionData.parameters, ...inputParameters };
-  sessionData.parameters = currentParameters; // Update sessionData's parameters
+// --- Nueva Lógica de Orquestación de Acciones ---
 
-  if (!sessionData.sync_api_results) sessionData.sync_api_results = {};
-  if (!sessionData.pendingApiResponses) sessionData.pendingApiResponses = {};
-
-  let effectiveIntent = intent;
-  if (!initialCall && !effectiveIntent && process.env.DEFAULT_INTENT) { // Avoid default intent on very first call if not desired
-    effectiveIntent = process.env.DEFAULT_INTENT;
-    logger.info({ sessionId, defaultIntent: effectiveIntent }, `FSM: No intent. Using DEFAULT_INTENT.`);
-  }
-
-  logger.debug({ sessionId, currentStateId, intent: effectiveIntent, inputParametersCount: Object.keys(inputParameters).length }, 'FSM processing input: Start');
-
-  // --- Phase 1: Determine Target State (current or next based on transitions) ---
-  // This logic determines the state whose 'synchronousCallSetup' should be processed.
-  // If there's an intent, we first see if it causes an immediate transition.
-  // If so, the target state for syncAPIs is the new state. Otherwise, it's the current state.
-
-  let preliminaryNextStateId = null;
-  let preliminaryMatchedTransition = false;
-  const fsmCurrentStateConfig = getStateById(currentStateId); // Config of the state *before* transitions for this input
-
-  if (effectiveIntent && fsmCurrentStateConfig.transitions && fsmCurrentStateConfig.transitions.length > 0) {
-    for (const transition of fsmCurrentStateConfig.transitions) {
-      if (transition.condition && transition.condition.intent === effectiveIntent) {
-        preliminaryNextStateId = transition.nextState;
-        preliminaryMatchedTransition = true;
-        break;
-      }
+function getActionDependencies(action, currentParameters, sessionData, allApiConfigs) {
+    let consumesParamsDef = null;
+    if (action.type === "API") {
+        const apiConfig = allApiConfigs[action.id]; // Usar un mapa pre-cargado para eficiencia
+        if (!apiConfig) return { met: false, missing: [`API config for ${action.id} not found`] };
+        consumesParamsDef = apiConfig.consumesParameters;
+    } else if (action.type === "SCRIPT") {
+        // Asumimos que los scripts pueden definir 'consumesParameters' en su objeto de acción en states.json
+        consumesParamsDef = action.consumesParameters;
     }
-  }
-  // Parameter-based transitions are typically evaluated *after* parameters for the current state are collected
-  // and after synchronous APIs for the current state might have run.
-  // For now, we'll assume synchronous APIs are primarily for the *current state* before parameter collection prompts,
-  // or for the *target state* if an intent causes an immediate transition.
 
-  const targetStateIdForSyncApis = preliminaryNextStateId || currentStateId;
-  const targetStateConfigForSyncApis = getStateById(targetStateIdForSyncApis);
-
-  if (!targetStateConfigForSyncApis) {
-    logger.error({ targetStateIdForSyncApis, sessionId }, 'FSM Error: Config for target state (for sync APIs) not found.');
-    throw new Error(`Config for target state ${targetStateIdForSyncApis} not found.`);
-  }
-
-  // --- Phase 2: Execute Synchronous API Calls (`synchronousCallSetup`) for the target state ---
-  const syncCallsDefinition = targetStateConfigForSyncApis.payloadResponse?.apiHooks?.synchronousCallSetup;
-  if (syncCallsDefinition && Array.isArray(syncCallsDefinition)) {
-    logger.info({sessionId, state: targetStateIdForSyncApis, apis: syncCallsDefinition}, "Executing synchronousCallSetup APIs");
-    for (const apiId of syncCallsDefinition) {
-      const correlationId = `sync_${apiId}_${Date.now()}`; // Simpler correlation for sync calls
-      const apiResponse = await apiCallerService.makeRequestAndWait(apiId, sessionId, correlationId, currentParameters);
-
-      // Namespace results to avoid collision and for clarity in templates
-      currentParameters.sync_api_results = currentParameters.sync_api_results || {};
-      currentParameters.sync_api_results[apiId] = apiResponse; // Store full response (status, data, error)
-      sessionData.parameters = currentParameters; // Update session parameters immediately
-
-      if (apiResponse.status === 'error') {
-        logger.warn({ sessionId, apiId, error: apiResponse.errorMessage }, 'Synchronous API call failed.');
-        // Potentially transition to a specific error state or add error flags for AI/templating
-        // For now, the error is in sync_api_results and can be checked by templates/AI
-      }
+    if (!consumesParamsDef || Object.keys(consumesParamsDef).length === 0) {
+        return { met: true, missing: [], templateParams: {} };
     }
-  }
 
-  // --- Phase 3: FSM Transition Logic (Now with potentially updated currentParameters from sync APIs) ---
-  // This is the main transition logic based on intent and allParametersMet for the *original* currentStateId
-  // Or, if a preliminaryNextStateId was determined by intent, that becomes the new currentStateId.
+    const missingParams = [];
+    const templateParams = {};
 
-  let nextStateId = currentStateId; // Start with current state
-  let finalNextStateConfig = fsmCurrentStateConfig; // And its config
+    for (const templateParamName in consumesParamsDef) {
+        const PDef = consumesParamsDef[templateParamName];
+        let value;
+        let valueFound = false;
 
-  if (preliminaryNextStateId) { // Intent-based transition already determined
-      nextStateId = preliminaryNextStateId;
-      finalNextStateConfig = getStateById(nextStateId);
-      if (!finalNextStateConfig) {
-          logger.error({ nextStateId, sessionId }, 'FSM Error: Config for intent-based next state not found.');
-          throw new Error(`Config for next state ${nextStateId} not found.`);
-      }
-      logger.debug({ sessionId, transitionTo: nextStateId, reason: `Intent match: ${effectiveIntent}` }, 'FSM transition by intent confirmed');
-  } else { // No intent-based transition, evaluate parameter-based transitions for fsmCurrentStateConfig
-      let parameterTransitionFound = false;
-      if (fsmCurrentStateConfig.transitions && fsmCurrentStateConfig.transitions.length > 0) {
-          for (const transition of fsmCurrentStateConfig.transitions) {
-              if (transition.condition && !transition.condition.intent) {
-                  if (typeof transition.condition.allParametersMet === 'undefined' || transition.condition.allParametersMet) {
-                      const requiredParams = fsmCurrentStateConfig.parameters?.required || [];
-                      const allRequiredMet = requiredParams.every(param => currentParameters.hasOwnProperty(param) && currentParameters[param] !== null && currentParameters[param] !== '');
-                      if (allRequiredMet) {
-                          nextStateId = transition.nextState;
-                          parameterTransitionFound = true;
-                          logger.debug({ sessionId, transitionTo: nextStateId, reason: 'All params met for current state' }, 'FSM transition by params');
-                          break;
-                      }
-                  } else if (transition.condition.allParametersMet === false) {
-                      nextStateId = transition.nextState;
-                      parameterTransitionFound = true;
-                      logger.debug({ sessionId, transitionTo: nextStateId, reason: 'Condition allParametersMet: false for current state' }, 'FSM transition by allParametersMet:false');
-                      break;
-                  }
-              }
-          }
-      }
-      if (!parameterTransitionFound && fsmCurrentStateConfig.defaultNextState) {
-          const requiredParams = fsmCurrentStateConfig.parameters?.required || [];
-          const allRequiredMet = requiredParams.every(param => currentParameters.hasOwnProperty(param) && currentParameters[param] !== null && currentParameters[param] !== '');
-          if (allRequiredMet) {
-              nextStateId = fsmCurrentStateConfig.defaultNextState;
-              logger.debug({ sessionId, transitionTo: nextStateId, reason: 'Default next state for current state, all params met' }, 'FSM transition by defaultNextState');
-          }
-      }
-      // If nextStateId changed, update finalNextStateConfig
-      if (nextStateId !== currentStateId) {
-          finalNextStateConfig = getStateById(nextStateId);
-          if (!finalNextStateConfig) {
-              logger.error({ nextStateId, sessionId }, 'FSM Error: Config for parameter-based next state not found.');
-              throw new Error(`Config for next state ${nextStateId} not found.`);
-          }
-      }
-  }
+        if (PDef.source === "USER_INPUT") {
+            if (currentParameters.hasOwnProperty(PDef.aiParamName) && currentParameters[PDef.aiParamName] !== null && currentParameters[PDef.aiParamName] !== '') {
+                value = currentParameters[PDef.aiParamName];
+                valueFound = true;
+            }
+        } else if (PDef.source === "API_RESULT" || PDef.source === "SCRIPT_RESULT") { // Added SCRIPT_RESULT
+            // producedParamName es el nombre estandarizado del parámetro tal como lo produce la API/Script
+            // (es decir, la clave en producesParameters de la API, o el assignResultTo del Script)
+            if (currentParameters.hasOwnProperty(PDef.producedParamName) && currentParameters[PDef.producedParamName] !== null) {
+                value = currentParameters[PDef.producedParamName];
+                valueFound = true;
+            }
+        } else if (PDef.source === "STATIC") {
+            value = PDef.value;
+            valueFound = true;
+        } else if (PDef.source === "SESSION_DATA") {
+            try { value = PDef.path.split('.').reduce((o, k) => (o || {})[k], sessionData); } catch (e) { value = undefined; }
+            if (typeof value !== 'undefined') valueFound = true;
+        } else if (PDef.source === "COLLECTED_PARAM") {
+            if (currentParameters.hasOwnProperty(PDef.paramName) && currentParameters[PDef.paramName] !== null && currentParameters[PDef.paramName] !== '') {
+                value = currentParameters[PDef.paramName];
+                valueFound = true;
+            }
+        }
 
-  if (currentStateId !== nextStateId) {
-    logger.info({ sessionId, fromState: currentStateId, toState: nextStateId }, `FSM transitioning`);
-    sessionData.currentStateId = nextStateId;
-    if (!sessionData.history.length || sessionData.history[sessionData.history.length - 1] !== nextStateId) {
-      sessionData.history.push(nextStateId);
+        if (valueFound) {
+            templateParams[templateParamName] = value;
+        } else if (PDef.required !== false) { // Es requerido y no se encontró
+            missingParams.push(templateParamName + (PDef.aiParamName ? ` (expected from AI as ${PDef.aiParamName})` : PDef.producedParamName ? ` (expected from API ${PDef.apiId} as ${PDef.producedParamName})` : ` (type: ${PDef.source})`));
+        }
     }
-  } else {
-    logger.debug({ sessionId, state: currentStateId }, 'FSM staying in current state');
-  }
-  // sessionData.parameters is already currentParameters
 
-  // --- Phase 4: Render PayloadResponse for the *final* next state ---
-  let renderedPayloadResponse = {};
-  if (finalNextStateConfig.payloadResponse) {
-    try {
-      // currentParameters now includes results from synchronousCallSetup
-      renderedPayloadResponse = processTemplate(
-        JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse)),
-        currentParameters
-      );
-    } catch (templateError) {
-      logger.error({ err: templateError, sessionId, state: nextStateId }, `FSM Error: Processing payloadResponse template for state.`);
-      renderedPayloadResponse = JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse)); // Fallback
+    if (missingParams.length > 0) {
+        return { met: false, missing: missingParams, templateParams: {} };
     }
-  }
+    return { met: true, missing: [], templateParams };
+}
 
-  // --- Phase 5: Initiate Asynchronous API Calls (`asynchronousCallDispatch`) for the *final* next state ---
-  // These are based on the state we are *now in* or *transitioning to definitively*.
-  // The `apiHooks` should be read from the *original* config, not the rendered one.
-  const asyncCallsDispatch = finalNextStateConfig.payloadResponse?.apiHooks?.asynchronousCallDispatch;
-  if (asyncCallsDispatch && Array.isArray(asyncCallsDispatch)) {
-    logger.info({sessionId, state: nextStateId, apis: asyncCallsDispatch}, "Initiating asynchronousCallDispatch APIs");
-    for (const apiId of asyncCallsDispatch) { // Assuming this is just an array of apiIds
-      const callDefinition = { apiId: apiId }; // Minimal definition if only apiId is provided
-      // If `asyncApiCallsToTrigger` structure was intended here, this loop needs adjustment
-      // For now, let's assume `asynchronousCallDispatch` contains objects like `asyncApiCallsToTrigger` items.
-      // The user's states.json uses simple strings, so we adapt:
+async function executeSingleAction(action, currentParameters, sessionData, sessionId, allApiConfigs) {
+    const actionId = action.id;
+    const logPayload = {sessionId, actionId, type: action.type, mode:action.executionMode, label: action.label};
 
-      const correlationId = uuidv4(); // Always generate new for async
+    // 1. Verificar runIfCondition ANTES de cualquier otra cosa
+    if (action.runIfCondition) {
+        const conditionParamPath = action.runIfCondition.paramPath;
+        const conditionExpectedValue = action.runIfCondition.equals; // Asumimos 'equals' por ahora
+        let actualValue;
+        try {
+            actualValue = conditionParamPath.split('.').reduce((o, k) => (o || {})[k], currentParameters);
+        } catch (e) {
+            actualValue = undefined;
+        }
 
-      // If 'assignCorrelationIdTo' was part of a richer object structure for these calls:
-      // if (callDefinition.assignCorrelationIdTo) {
-      //   currentParameters[callDefinition.assignCorrelationIdTo] = correlationId;
-      //   sessionData.parameters[callDefinition.assignCorrelationIdTo] = correlationId;
-      // }
-
-      let processedApiParams = {}; // Params for async calls might be defined differently or use currentParameters
-      // if (callDefinition.params) {
-      //   processedApiParams = processTemplate(JSON.parse(JSON.stringify(callDefinition.params)), currentParameters);
-      // }
-
-      const apiConfig = getApiConfigById(apiId); // apiId directly from the array
-      if (!apiConfig || !apiConfig.response_stream_key_template) {
-        logger.error({ apiId, sessionId }, `FSM: Missing apiConfig or response_stream_key_template for async call. Skipping.`);
-        continue;
-      }
-
-      const templateContextForStreamKey = { ...currentParameters, correlationId, sessionId };
-      const responseStreamKey = processTemplate(apiConfig.response_stream_key_template, templateContextForStreamKey);
-
-      sessionData.pendingApiResponses[correlationId] = {
-        apiId: apiId,
-        responseStreamKey: responseStreamKey,
-        requestedAt: new Date().toISOString(),
-      };
-      logger.info({sessionId, correlationId, apiId, responseStreamKey}, "FSM: Marked async API call as pending.");
-
-      apiCallerService.makeRequestAsync(apiId, sessionId, correlationId, processedApiParams);
+        if (actualValue !== conditionExpectedValue) {
+            logger.debug({...logPayload, conditionPath: conditionParamPath, actualValue, expectedValue: conditionExpectedValue}, "Action skipped due to runIfCondition not met.");
+            return { skipped_conditional: true, conditionNotMet: true };
+        }
+        logger.debug({...logPayload, conditionPath: conditionParamPath, actualValue, expectedValue: conditionExpectedValue}, "runIfCondition met.");
     }
-  }
 
-  const requiredForNext = finalNextStateConfig.parameters?.required || [];
-  const optionalForNext = finalNextStateConfig.parameters?.optional || [];
-  const parametersToCollect = {
-    required: requiredForNext.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === ''),
-    optional: optionalForNext.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === '')
-  };
+    logger.debug(logPayload, "Attempting to execute action (post runIfCondition if any)");
 
-  const sessionTTL = parseInt(process.env.REDIS_SESSION_TTL, 10);
-  saveSessionAsync(sessionKey, sessionData, sessionTTL);
+    let apiConfig;
+    if (action.type === "API") {
+        apiConfig = allApiConfigs[actionId];
+        if (!apiConfig) {
+            logger.error({ sessionId, actionId }, "API config not found for action.");
+            return { error: `API config for ${actionId} not found` };
+        }
+        if (action.ignoreIfOutputExists && apiConfig.producesParameters) {
+            const outputs = Object.keys(apiConfig.producesParameters);
+            if (outputs.every(outParam => currentParameters.hasOwnProperty(outParam))) {
+                logger.info({sessionId, actionId}, "Skipping API action as its output already exists and ignoreIfOutputExists is true.");
+                return { skipped: true };
+            }
+        }
+    } else if (action.type === "SCRIPT") {
+        if (action.ignoreIfOutputExists && action.assignResultTo && currentParameters.hasOwnProperty(action.assignResultTo)) {
+            logger.info({sessionId, actionId}, "Skipping SCRIPT action as its output already exists and ignoreIfOutputExists is true.");
+            return { skipped: true };
+        }
+    } else {
+        return { error: `Unknown action type: ${action.type}` };
+    }
 
-  logger.debug({ sessionId, finalState: nextStateId, paramsToCollectCount: parametersToCollect.required.length }, 'FSM processing complete.');
+    const { templateParams } = getActionDependencies(action, currentParameters, sessionData, allApiConfigs);
+    // Nota: getActionDependencies ya chequea 'required'. Aquí asumimos que se llamó antes y dio 'met:true'.
+    // O, si se llama aquí, necesitamos manejar el 'met:false'. Por ahora, el planificador lo hará antes.
 
-  return {
-    nextStateId: nextStateId, // The state ID FSM has decided upon
-    currentStateConfig: fsmCurrentStateConfig, // Config of state at start of this processInput
-    nextStateConfig: finalNextStateConfig, // Config of the state FSM is now in
-    parametersToCollect: parametersToCollect,
-    payloadResponse: renderedPayloadResponse,
-    sessionData: sessionData, // Contains updated .parameters, .pendingApiResponses, .sync_api_results
-  };
+    if (action.type === "API") {
+        const correlationId = `${action.executionMode === "SYNCHRONOUS" ? "sync" : "async"}_${actionId}_${Date.now()}`;
+        if (action.executionMode === "SYNCHRONOUS") {
+            const apiResponse = await apiCallerService.makeRequestAndWait(actionId, sessionId, correlationId, templateParams);
+            currentParameters.sync_api_results = currentParameters.sync_api_results || {};
+            currentParameters.sync_api_results[actionId] = apiResponse;
+            if (apiResponse.status === 'success' && apiConfig.producesParameters) {
+                for (const standardName in apiConfig.producesParameters) {
+                    const pathInResponse = apiConfig.producesParameters[standardName];
+                    let value;
+                    try { value = pathInResponse.split('.').reduce((o, k) => (o || {})[k], apiResponse); } catch(e) { value = undefined; }
+                    if (typeof value !== 'undefined') currentParameters[standardName] = value;
+                    else logger.warn({sessionId, actionId, standardName, pathInResponse}, "Could not map API producedParameter.");
+                }
+            }
+            return { success: true, data: apiResponse };
+        } else { // ASYNCHRONOUS
+            if (!apiConfig.response_stream_key_template) {
+                return { error: `Missing response_stream_key_template for async API ${actionId}`};
+            }
+            const streamCorrId = uuidv4();
+            const templateContextForStreamKey = { ...currentParameters, ...templateParams, correlationId: streamCorrId, sessionId };
+            const responseStreamKey = processTemplate(apiConfig.response_stream_key_template, templateContextForStreamKey);
+
+            const pendingResponseEntry = {
+                apiId: actionId,
+                responseStreamKey,
+                requestedAt: new Date().toISOString()
+            };
+            if (action.waitForResult) { // NUEVO: Guardar configuración de waitForResult
+                pendingResponseEntry.waitForResultConfig = action.waitForResult;
+                logger.debug({sessionId, correlationId: streamCorrId, apiId: actionId, waitForResultConfig: action.waitForResult}, "ASYNCHRONOUS API call includes waitForResult config.");
+            }
+            sessionData.pendingApiResponses[streamCorrId] = pendingResponseEntry;
+
+            apiCallerService.makeRequestAsync(actionId, sessionId, streamCorrId, templateParams);
+            logger.info({sessionId, correlationId: streamCorrId, apiId: actionId}, "Dispatched ASYNCHRONOUS API call.");
+            return { dispatchedAsync: true, correlationId: streamCorrId };
+        }
+    } else if (action.type === "SCRIPT") {
+        const scriptExecutionOutcome = await scriptExecutor.executeScript(action, currentParameters, sessionId);
+
+        currentParameters.script_results = currentParameters.script_results || {};
+        currentParameters.script_results[action.id] = scriptExecutionOutcome; // Guardar el outcome completo
+
+        if (scriptExecutionOutcome.error) {
+            logger.warn({ sessionId, scriptId: action.id, error: scriptExecutionOutcome.error }, 'Script execution failed at executor level.');
+            return { error: scriptExecutionOutcome.error, scriptOutputInternal: scriptExecutionOutcome };
+        }
+
+        const scriptReturn = scriptExecutionOutcome.result;
+
+        if (typeof scriptReturn !== 'object' || scriptReturn === null || !scriptReturn.status) {
+            logger.warn({sessionId, scriptId: action.id, returned: scriptReturn}, "Script did not return a standard structured object with 'status'. Handling as direct result for backward compatibility or simple scripts.");
+            if (action.assignResultTo && typeof scriptReturn !== 'undefined') {
+                currentParameters[action.assignResultTo] = scriptReturn;
+            }
+            if (action.canForceTransition && typeof scriptReturn === 'object' && scriptReturn !== null && scriptReturn.forceTransitionToState) {
+                 logger.info({sessionId, scriptId: action.id, forcedTransitionDetails: scriptReturn}, "Script (legacy forcedTransition format) forcing transition.");
+                 return { success: true, data: scriptReturn, forcedTransition: { nextState: scriptReturn.forceTransitionToState, intent: scriptReturn.intent, parameters: scriptReturn.parameters } };
+            }
+            return { success: true, data: scriptReturn };
+        }
+
+        switch (scriptReturn.status) {
+            case "SUCCESS":
+                if (action.assignResultTo && typeof scriptReturn.output !== 'undefined') {
+                    currentParameters[action.assignResultTo] = scriptReturn.output;
+                }
+                logger.info({sessionId, scriptId: action.id, output: scriptReturn.output}, "Script executed successfully with SUCCESS status.");
+                return { success: true, data: scriptReturn.output };
+            case "ERROR":
+                logger.error({ sessionId, scriptId: action.id, message: scriptReturn.message, errorCode: scriptReturn.errorCode }, 'Script reported an ERROR status.');
+                return { error: scriptReturn.message || `Script ${action.id} reported an error`, errorCode: scriptReturn.errorCode, scriptOutputInternal: scriptReturn };
+            case "FORCE_TRANSITION":
+                if (action.canForceTransition && scriptReturn.transitionDetails && scriptReturn.transitionDetails.nextStateId) {
+                    logger.info({ sessionId, scriptId: action.id, transitionDetails: scriptReturn.transitionDetails }, "Script forcing transition with new structured format.");
+                    return {
+                        success: true,
+                        forcedTransition: {
+                            nextState: scriptReturn.transitionDetails.nextStateId,
+                            intent: scriptReturn.transitionDetails.intent,
+                            parameters: scriptReturn.transitionDetails.parameters
+                        },
+                        data: scriptReturn
+                    };
+                } else {
+                    logger.warn({ sessionId, scriptId: action.id, scriptReturn }, "Script tried to FORCE_TRANSITION, but 'canForceTransition' is false or details missing. Treating as SUCCESS.");
+                    if (action.assignResultTo && typeof scriptReturn.output !== 'undefined') {
+                         currentParameters[action.assignResultTo] = scriptReturn.output;
+                    }
+                    return { success: true, data: scriptReturn.output || scriptReturn };
+                }
+            default:
+                logger.warn({ sessionId, scriptId: action.id, unknownStatus: scriptReturn.status, returnedValue: scriptReturn }, "Script returned unknown status in structured object.");
+                return { error: `Script ${action.id} returned unknown status: ${scriptReturn.status}`, scriptOutputInternal: scriptReturn };
+        }
+    }
+}
+
+function getSkippedStateConfigs(startStateId, endStateId, allStatesMap) {
+    if (startStateId === endStateId) return [];
+    const queue = [[startStateId, []]]; // currId, path_configs_to_curr_excluding_start
+    const visited = new Set([startStateId]);
+    while (queue.length > 0) {
+        const [currId, path] = queue.shift();
+        const currConfig = allStatesMap[currId];
+        if (!currConfig) continue;
+        const transitions = currConfig.transitions || [];
+        const nextPossibleIds = transitions.map(t => t.nextState);
+        if (currConfig.defaultNextState) nextPossibleIds.push(currConfig.defaultNextState);
+
+        for (const nextId of nextPossibleIds) {
+            if (nextId === endStateId) return path; // Path are the skipped states
+            if (nextId && allStatesMap[nextId] && !visited.has(nextId)) {
+                visited.add(nextId);
+                queue.push([nextId, [...path, allStatesMap[nextId]]]);
+            }
+        }
+    }
+    return []; // No direct path found implies direct transition or error
+}
+
+async function processInput(sessionId, intent, inputParametersAi = {}, initialCall = false, userInputText = null) {
+    const sessionKey = `${FSM_SESSION_PREFIX}${sessionId}`;
+    let sessionData = await initializeOrRestoreSession(sessionId);
+    let currentParameters = { ...sessionData.parameters, ...inputParametersAi };
+    sessionData.parameters = currentParameters;
+
+    const fsmCurrentStateConfigAtStart = getStateById(sessionData.currentStateId);
+    logger.debug({ sessionId, currentState: sessionData.currentStateId, intent }, 'FSM processInput: Start');
+
+    // 1. Determinar Estado Objetivo (candidateNextStateId)
+    let candidateNextStateId = sessionData.currentStateId;
+    // ... (Lógica de transición: si intent o allParametersMet para awaitsUserInputParameters del estado actual)
+    const requiredForCurrentTransition = fsmCurrentStateConfigAtStart.stateLogic?.awaitsUserInputParameters?.required || [];
+    const allParamsMetForCurrent = requiredForCurrentTransition.every(p => currentParameters.hasOwnProperty(p) && currentParameters[p] !== null && currentParameters[p] !== '');
+
+    if (fsmCurrentStateConfigAtStart.transitions) {
+        for (const transition of fsmCurrentStateConfigAtStart.transitions) {
+            let conditionMet = false;
+            if (transition.condition.intent && transition.condition.intent === intent) conditionMet = true;
+            if (transition.condition.allParametersMet && allParamsMetForCurrent) conditionMet = true;
+            // TODO: Add more complex condition checks (e.g., specific param value)
+            if (conditionMet) {
+                candidateNextStateId = transition.nextState;
+                break;
+            }
+        }
+    }
+    if (candidateNextStateId === sessionData.currentStateId && fsmCurrentStateConfigAtStart.defaultNextState && allParamsMetForCurrent) {
+        candidateNextStateId = fsmCurrentStateConfigAtStart.defaultNextState;
+    }
+    const candidateNextStateConfig = getStateById(candidateNextStateId);
+    if (!candidateNextStateConfig) throw new Error(`Config for candidate state ${candidateNextStateId} not found.`);
+
+    // 2. Recopilar Acciones de Estados a Procesar (Saltados + Candidato)
+    const allApiConfigs = getApiConfigById(); // Obtener todas las configs de API una vez
+    const allStatesMap = getAllStatesConfig();
+    const skippedStateConfigs = getSkippedStateConfigs(sessionData.currentStateId, candidateNextStateId, allStatesMap);
+    const statesToProcessConfigs = [...skippedStateConfigs, candidateNextStateConfig];
+
+    let masterActionPlan = []; // { action, stateId, status: 'pending'/'done'/'error'/'skipped', result }
+
+    for (const stateConfig of statesToProcessConfigs) {
+        (stateConfig.stateLogic?.onEntry || []).forEach(action => {
+            masterActionPlan.push({ ...action, stateId: stateConfig.id, status: 'pending' });
+        });
+    }
+
+    // --- Añadir Acciones Inducidas por dataRequirementsForPrompt ---
+    const requiredByPromptParams = new Set();
+    if (candidateNextStateConfig.payloadResponse?.prompts) {
+        for (const key in candidateNextStateConfig.payloadResponse.prompts) {
+            if (typeof candidateNextStateConfig.payloadResponse.prompts[key] === 'string') {
+                extractTemplateParams(candidateNextStateConfig.payloadResponse.prompts[key])
+                    .forEach(param => requiredByPromptParams.add(param));
+            }
+        }
+    }
+    if (candidateNextStateConfig.payloadResponse?.customInstructions) {
+        extractTemplateParams(candidateNextStateConfig.payloadResponse.customInstructions)
+            .forEach(param => requiredByPromptParams.add(param));
+    }
+    (candidateNextStateConfig.stateLogic?.dataRequirementsForPrompt || []).forEach(param => requiredByPromptParams.add(param));
+
+    if (requiredByPromptParams.size > 0) {
+        logger.debug({ sessionId, params: Array.from(requiredByPromptParams) }, "Parameters identified as required by candidate state's prompts/customInstructions.");
+        for (const paramName of requiredByPromptParams) {
+            if (!currentParameters.hasOwnProperty(paramName)) {
+                let foundProducer = false;
+                // `allApiConfigs` es un mapa de apiId -> apiConfig
+                for (const apiId in allApiConfigs) {
+                    const apiConfig = allApiConfigs[apiId];
+                    if (apiConfig.producesParameters && apiConfig.producesParameters.hasOwnProperty(paramName)) {
+                        const existingAction = masterActionPlan.find(a => a.id === apiId && a.type === "API");
+                        if (!existingAction) {
+                            logger.info({ sessionId, paramName, producingApiId: apiId }, `Adding API to plan: produces parameter required by prompt.`);
+                            masterActionPlan.push({
+                                label: `Induced by prompt requirement for {{${paramName}}}`,
+                                type: "API",
+                                id: apiId,
+                                executionMode: "SYNCHRONOUS", // Debe ser síncrona si es para el prompt actual
+                                stateId: candidateNextStateConfig.id,
+                                status: 'pending',
+                                isCriticalForPrompt: true // Marcarla como crítica
+                            });
+                        } else if (existingAction.executionMode === "ASYNCHRONOUS") {
+                            logger.warn({sessionId, paramName, existingAction},"Parameter for prompt produced by an API already in plan as ASYNCHRONOUS. This might lead to the parameter not being available for the current prompt. Consider making the onEntry action SYNCHRONOUS or using dataRequirementsForPrompt to enforce synchronous execution if needed earlier.");
+                        }
+                        foundProducer = true;
+                        break;
+                    }
+                }
+                if (!foundProducer) {
+                    // Podría también verificar si un SCRIPT produce este parámetro si los scripts definieran 'producesParameters'
+                    logger.warn({sessionId, paramName}, "Parameter required by prompt, but no API producer found for it and not in currentParameters.");
+                }
+            }
+        }
+    }
+    // --- FIN de Añadir Acciones Inducidas ---
+
+    // 3. Planificación y Ejecución de Tareas Síncronas usando Grafo y Orden Topológico
+    let initialSyncTasksFromPlan = masterActionPlan.filter(task => task.executionMode === "SYNCHRONOUS" && task.status === 'pending');
+
+    if (initialSyncTasksFromPlan.length > 0) {
+        logger.info({sessionId, count: initialSyncTasksFromPlan.length}, "Building dependency graph for synchronous actions.");
+        const { graph, taskMap: syncTaskMap, unresolvedTasks: unresolvedTasksOnInit } =
+            buildSyncActionGraph(initialSyncTasksFromPlan, currentParameters, sessionData, allApiConfigs, sessionId);
+
+        unresolvedTasksOnInit.forEach(unresolvedTask => {
+            const planTask = masterActionPlan.find(t => t.uniqueId === unresolvedTask.uniqueId);
+            if (planTask) {
+                planTask.status = 'unresolved_user_input';
+                planTask.missingDeps = unresolvedTask.missingDeps; // Asignar missingDeps si buildSyncActionGraph lo populó
+                logger.warn({sessionId, action: planTask.id, state: planTask.stateId, missing: planTask.missingDeps, uniqueId: planTask.uniqueId}, "Synchronous action unresolved due to missing initial USER_INPUT.");
+            }
+        });
+
+        const resolvableTasksForGraphBuild = initialSyncTasksFromPlan.filter(task => !unresolvedTasksOnInit.some(ut => ut.uniqueId === task.uniqueId));
+        const { graph: resolvableGraph, taskMap: resolvableTaskMapForSort } =
+            buildSyncActionGraph(resolvableTasksForGraphBuild, currentParameters, sessionData, allApiConfigs, sessionId);
+
+        const sortedTasks = topologicalSort(resolvableGraph, resolvableTaskMapForSort, []);
+
+        if (sortedTasks) {
+            logger.info({sessionId, count: sortedTasks.length}, "Executing synchronous actions in topological order.");
+            for (const task of sortedTasks) {
+                // La tarea ya fue evaluada por getActionDependencies dentro de buildSyncActionGraph para USER_INPUT iniciales.
+                // El ordenamiento topológico asegura que las dependencias API_RESULT/SCRIPT_RESULT de otras tareas síncronas en el plan se respetan.
+                logger.debug({sessionId, actionId: task.id, stateId: task.stateId, uniqueId: task.uniqueId}, "Executing topologically sorted synchronous action.");
+                const result = await executeSingleAction(task, currentParameters, sessionData, sessionId, allApiConfigs);
+
+                const planTaskToUpdate = masterActionPlan.find(t => t.uniqueId === task.uniqueId);
+                if (planTaskToUpdate) {
+                    planTaskToUpdate.status = result.error ? 'error' : (result.skipped ? 'skipped' : 'done');
+                    planTaskToUpdate.result = result;
+                    if (result.forcedTransition) {
+                        candidateNextStateId = result.forcedTransition.nextState;
+                        logger.info({sessionId, forcedTo: candidateNextStateId, byScript: task.id}, "Script forced transition.");
+                        // TODO: Considerar si detener la ejecución síncrona aquí y re-planificar.
+                    }
+                    if (result.error) {
+                        logger.error({sessionId, actionId: task.id, error: result.error}, "Error executing synchronous action. Dependent tasks might be affected.");
+                        // TODO: Propagar fallo a tareas dependientes en el grafo.
+                    }
+                }
+            }
+        } else if (resolvableTaskMapForSort.size > 0) {
+            logger.error({sessionId, taskCount: resolvableTaskMapForSort.size}, "Could not establish a valid execution order for resolvable synchronous actions (cycle detected or other complex unresolved dependencies).");
+            resolvableTaskMapForSort.forEach(task => {
+                const planTask = masterActionPlan.find(t => t.uniqueId === task.uniqueId);
+                if (planTask && planTask.status === 'pending') {
+                     planTask.status = 'unresolved_cycle_or_dependency';
+                }
+            });
+        }
+    } else {
+        logger.info({sessionId}, "No pending synchronous actions to execute via graph.");
+    }
+
+    // Loguear el estado final de todas las tareas síncronas originalmente planeadas
+    masterActionPlan.filter(t => t.executionMode === "SYNCHRONOUS")
+        .forEach(task => {
+            if (task.status !== 'done' && task.status !== 'skipped') {
+                 logger.warn({sessionId, action: task.id, state: task.stateId, status: task.status, missing: task.missingDeps, result: task.result, uniqueId:task.uniqueId}, "Final status of a synchronous action.");
+            }
+        });
+
+    // 4. Despacho de Acciones Asíncronas de `onEntry` (de todos los estados procesados)
+    for (const task of masterActionPlan) {
+        if (task.status === 'pending' && task.executionMode === 'ASYNCHRONOUS') {
+             const { met } = getActionDependencies(task, currentParameters, sessionData, allApiConfigs);
+             if (met) {
+                await executeSingleAction(task, currentParameters, sessionData, sessionId, allApiConfigs); // Despacha
+                task.status = 'dispatched'; // Marcar como despachada
+             } else {
+                logger.warn({sessionId, action: task.id, state: t.stateId, missing: task.missingDeps}, "Skipping ASYNC action due to unmet dependencies.");
+                task.status = 'skipped_deps';
+             }
+        }
+    }
+
+    // 5. Transición Final y Renderizado
+    const finalNextStateId = candidateNextStateId; // Actualizado si un script forzó
+    const finalNextStateConfig = getStateById(finalNextStateId);
+     if (!finalNextStateConfig) throw new Error(`Config for FINAL state ${finalNextStateId} not found.`);
+
+
+    if (sessionData.currentStateId !== finalNextStateId) {
+        const onTransitionActions = fsmCurrentStateConfigAtStart.stateLogic?.onTransition || [];
+        for (const action of onTransitionActions) { // Generalmente asíncronas
+             const { met } = getActionDependencies(action, currentParameters, sessionData, allApiConfigs);
+             if(met) await executeSingleAction(action, currentParameters, sessionData, sessionId, allApiConfigs);
+        }
+        logger.info({ sessionId, fromState: sessionData.currentStateId, toState: finalNextStateId }, `FSM transitioning`);
+        sessionData.currentStateId = finalNextStateId;
+        if (!sessionData.history.includes(finalNextStateId)) sessionData.history.push(finalNextStateId);
+    }
+
+    let renderedPayloadResponse = {};
+    if (finalNextStateConfig.payloadResponse) {
+        try {
+            renderedPayloadResponse = processTemplate(JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse)), currentParameters);
+        } catch (templateError) {
+            logger.error({ err: templateError, sessionId, state: finalNextStateId }, `Error processing payloadResponse template.`);
+            renderedPayloadResponse = JSON.parse(JSON.stringify(finalNextStateConfig.payloadResponse));
+        }
+    }
+
+    const parametersToCollect = { required: [], optional: [] };
+    const requiredForNextState = finalNextStateConfig.stateLogic?.awaitsUserInputParameters?.required || [];
+    const optionalForNextState = finalNextStateConfig.stateLogic?.awaitsUserInputParameters?.optional || [];
+    parametersToCollect.required = requiredForNextState.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === '');
+    parametersToCollect.optional = optionalForNextState.filter(p => !currentParameters.hasOwnProperty(p) || currentParameters[p] === null || currentParameters[p] === '');
+
+    saveSessionAsync(sessionKey, sessionData);
+    return {
+        sessionId,
+        currentStateId: finalNextStateId,
+        nextStateId: finalNextStateId,
+        parametersToCollect,
+        payloadResponse: renderedPayloadResponse,
+        collectedParameters: currentParameters,
+    };
 }
 
 module.exports = {
   initializeOrRestoreSession,
   processInput,
-  saveSessionAsync, // Exported for potential use by index.js if session needs saving outside fsm.processInput
+  saveSessionAsync,
   FSM_SESSION_PREFIX
 };
+```

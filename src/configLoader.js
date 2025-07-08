@@ -83,8 +83,18 @@ function getInitialStateId() {
   return config.initialState;
 }
 
+/**
+ * Obtiene el objeto completo de todos los estados definidos.
+ * @returns {object} El objeto que contiene todos los estados.
+ */
+function getAllStates() {
+  const config = loadStateConfig();
+  return config.states;
+}
+
 module.exports = {
   loadStateConfig,
   getStateById,
   getInitialStateId,
+  getAllStates, // Nueva exportación
 };

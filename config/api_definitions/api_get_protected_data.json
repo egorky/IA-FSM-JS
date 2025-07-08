@@ -1,0 +1,20 @@
+{
+  "apiId": "api_get_protected_data",
+  "description": "API de ejemplo que requiere autenticación Bearer Token.",
+  "url_template": "https://api.example.com/secure/data/{{params.resourceId}}",
+  "method": "GET",
+  "authentication": {
+    "authProfileId": "defaultBearerAuth",
+    "tokenPlacement": {
+      "in": "HEADER",
+      "scheme": "Bearer",
+      "name": "Authorization"
+    }
+  },
+  "producesParameters": {
+    "protectedDataPayload": "data"
+  },
+  "consumesParameters": {
+    "resourceId": { "source": "USER_INPUT", "aiParamName": "requested_resource_id", "required": true }
+  }
+}

@@ -32,12 +32,13 @@ async function logToRedis(key, data) {
   }
 }
 
-async function getOpenAIResponse(textInput, prompt) {
+async function getOpenAIResponse(textInput, prompt, sessionId) { // Added sessionId
   if (!openai) {
     throw new Error('OpenAI provider selected but API key not provided or client not initialized.');
   }
   const fullPrompt = `${prompt}\n\nInput Text: "${textInput}"\n\nOutput JSON:\n`;
-  await logToRedis(`ai_input:openai:${Date.now()}`, { textInput, prompt: fullPrompt });
+  // logToRedis already includes textInput and fullPrompt. sessionId can be added if useful there too.
+  // The new debug log will be in getAIResponse.
 
   try {
     const completion = await openai.chat.completions.create({
@@ -60,14 +61,14 @@ async function getOpenAIResponse(textInput, prompt) {
   }
 }
 
-async function getGoogleGeminiResponse(textInput, prompt) {
+async function getGoogleGeminiResponse(textInput, prompt, sessionId) { // Added sessionId
   if (!genAI) {
     throw new Error('Google Gemini provider selected but API key not provided or client not initialized.');
   }
   const fullPrompt = `${prompt}\n\nInput Text: "${textInput}"\n\nRespond with a valid JSON object. Output JSON:\n`;
   // Gemini specific instructions for JSON output are now primarily handled by responseSchema.
   // The prompt should still guide towards a JSON structure.
-  await logToRedis(`ai_input:google:${Date.now()}`, { textInput, prompt: fullPrompt });
+  // logToRedis already includes textInput and fullPrompt.
 
   try {
     const modelName = process.env.GEMINI_MODEL || "gemini-pro"; // e.g., "gemini-1.5-flash-latest" or "gemini-pro"
@@ -158,12 +159,12 @@ async function getGoogleGeminiResponse(textInput, prompt) {
   }
 }
 
-async function getGroqResponse(textInput, prompt) {
+async function getGroqResponse(textInput, prompt, sessionId) { // Added sessionId
   if (!groq) {
     throw new Error('Groq provider selected but API key not provided or client not initialized.');
   }
   const fullPrompt = `${prompt}\n\nInput Text: "${textInput}"\n\nOutput JSON:\n`;
-  await logToRedis(`ai_input:groq:${Date.now()}`, { textInput, prompt: fullPrompt });
+  // logToRedis already includes textInput and fullPrompt.
 
   try {
     const chatCompletion = await groq.chat.completions.create({
@@ -186,7 +187,8 @@ async function getGroqResponse(textInput, prompt) {
   }
 }
 
-async function getAIResponse(textInput, promptContent) {
+// Modified getAIResponse to accept sessionId for logging purposes
+async function getAIResponse(textInput, promptContent, sessionId) {
   if (!AI_PROVIDER) {
     logger.error('AI_PROVIDER environment variable is not set.');
     throw new Error('AI_PROVIDER environment variable is not set.');
@@ -196,15 +198,31 @@ async function getAIResponse(textInput, promptContent) {
     throw new Error('Prompt content is empty or not loaded.');
   }
 
-  logger.info({ provider: AI_PROVIDER, textInputLength: textInput.length }, 'Requesting AI response');
+  // Log the full prompt details at DEBUG level, including sessionId
+  // The actual textInput might be very long, consider truncating if logs become too verbose,
+  // or rely on the Redis log for the full content. For now, logging full.
+  logger.debug({
+    sessionId: sessionId, // Include sessionId here
+    provider: AI_PROVIDER,
+    textInputToAI: textInput, // This is the `fullTextInputForAI` from index.js
+    systemPromptToAI: promptContent // This is the content of `aiPrompt.txt`
+  }, "Full prompt details being sent to AI provider.");
+
+  // Log to Redis (this was already present in provider-specific functions, can be centralized or kept there)
+  // For consistency, let's assume the provider-specific functions will call logToRedis with their specific `fullPrompt`
+  // which includes the textInput and the system prompt combined.
+  // Example: await logToRedis(`ai_input:${AI_PROVIDER}:${sessionId}:${Date.now()}`, { textInput, systemPrompt: promptContent });
+
+
+  logger.info({ sessionId: sessionId, provider: AI_PROVIDER, textInputLength: textInput.length }, 'Requesting AI response');
 
   switch (AI_PROVIDER) {
     case 'openai':
-      return getOpenAIResponse(textInput, promptContent);
+      return getOpenAIResponse(textInput, promptContent, sessionId); // Pass sessionId
     case 'google':
-      return getGoogleGeminiResponse(textInput, promptContent);
+      return getGoogleGeminiResponse(textInput, promptContent, sessionId); // Pass sessionId
     case 'groq':
-      return getGroqResponse(textInput, promptContent);
+      return getGroqResponse(textInput, promptContent, sessionId); // Pass sessionId
     default:
       logger.error(`Unsupported AI_PROVIDER: ${AI_PROVIDER}`);
       throw new Error(`Unsupported AI_PROVIDER: ${AI_PROVIDER}`);

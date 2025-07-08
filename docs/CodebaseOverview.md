@@ -1,122 +1,137 @@
-# Visión General del Código Base - FSM con IA y API Sincrónicas/Asíncronas (Redis Streams)
+# Visión General del Código Base - FSM con IA, APIs Sincrónicas/Asíncronas, Scripts JS y Más
 
-Este documento detalla la estructura y flujo del proyecto FSM, ahora con capacidades de IA y manejo diferenciado de llamadas API síncronas y asíncronas.
+Este documento detalla la estructura y flujo del proyecto FSM, que ha sido extendido con capacidades avanzadas de IA, manejo de estados saltados, ejecución de scripts JS, dependencias configurables para acciones, y mejor gestión de datos, incluyendo un sistema de autenticación centralizado para APIs.
 
 ## Estructura del Proyecto Clave
 
 ```
 .
 ├── config/
-│   ├── states.json                 # Lógica FSM. Ahora con payloadResponse.apiHooks.synchronousCallSetup y .asynchronousCallDispatch
-│   ├── aiPrompt.txt                # Prompt IA (instrucciones para usar sync_api_results y API Response Context)
-│   ├── aiResponseSchema.json       # Esquema validación IA
-│   ├── customAIResponseValidator.js # Validador JS personalizado IA
-│   └── api_definitions/            # Definiciones de API externas (url, method, plantillas, timeout, response_stream_key_template)
-│       └── (ej: fetch_user.json)
+│   ├── states.json                 # Lógica FSM. Incluye stateLogic con onEntry, awaitsUserInputParameters.
+│   ├── aiPrompt.txt                # Prompt IA.
+│   ├── aiResponseSchema.json       # Esquema validación IA.
+│   ├── customAIResponseValidator.js # Validador JS personalizado IA.
+│   ├── api_definitions/            # Definiciones de API externas (ahora con sección opcional `authentication`).
+│   │   ├── api_generate_system_token.json # Ejemplo de API para generar tokens
+│   │   └── api_get_protected_data.json    # Ejemplo de API que usa autenticación
+│   ├── auth_profiles/              # Nuevo: Perfiles de autenticación reutilizables.
+│   │   └── defaultBearerAuth.json    # Ejemplo de perfil para Bearer Tokens
+│   └── scripts/                    # Directorio para snippets de código JS.
+│       ├── auth/                   # Scripts para la lógica de autenticación
+│       │   ├── manageToken.js
+│       │   ├── cacheNewToken.js
+│       │   └── setActiveToken.js
+│       └── prompt_formatters/
+│           └── city_prompts.js
 ├── docs/
-│   └── CodebaseOverview.md         # Este archivo
+│   ├── CodebaseOverview.md         # Este archivo.
+│   ├── ARI_Integration.md          # Documentación de la interfaz con Asterisk ARI.
+│   ├── StateConfiguration.md       # Nuevo: Detalle de la configuración de estados.
+│   ├── ActionDefinitionsDetail.md  # Nuevo: Detalle de la definición de APIs, Scripts y Perfiles de Auth.
+│   └── FSM_Documentation.md        # Documentación general de la FSM.
 ├── scripts/
-│   └── simulateApiResponder.js     # CLI para XADD respuestas API simuladas a Redis Streams
+│   └── simulateApiResponder.js     # CLI para simular respuestas API a Redis Streams (con MAXLEN).
 ├── src/
-│   ├── index.js                    # Orquestador: maneja input, espera/lee de streams, llama IA, llama FSM
-│   ├── logger.js                   # Pino logger
-│   ├── aiService.js                # Interactúa con proveedores IA
-│   ├── jsonValidator.js            # Valida JSON de IA
-│   ├── apiConfigLoader.js          # Carga config/api_definitions/
-│   ├── apiCallerService.js         # Métodos makeRequestAndWait (sync) y makeRequestAsync (async) con Axios
-│   ├── configLoader.js             # Carga states.json
-│   ├── fsm.js                      # Motor FSM: ejecuta sync APIs, lógica de transición, despacha async APIs
-│   ├── redisClient.js              # Cliente Redis: funciones Stream (xadd, xreadgroup, xack, xgroupCreate), cliente subscriber
-│   └── templateProcessor.js        # Procesa plantillas ({{...}})
-├── .env.example                    # Variables de entorno (timeouts API, config Redis Stream)
-├── package.json                    # Dependencias (axios, uuid)
-└── README.md, AGENTS.md, FSM_Documentation.md # Documentación principal (actualizada)
+│   ├── index.js                    # Orquestador principal.
+│   ├── logger.js                   # Pino logger.
+│   ├── aiService.js                # Interactúa con proveedores IA.
+│   ├── jsonValidator.js            # Valida JSON de IA.
+│   ├── apiConfigLoader.js          # Carga config/api_definitions/.
+│   ├── authProfileLoader.js        # Nuevo: Carga config/auth_profiles/.
+│   ├── authService.js              # Nuevo: Gestiona la obtención y caché de tokens de autenticación.
+│   ├── apiCallerService.js         # Métodos makeRequestAndWait/Async. Integra AuthService.
+│   ├── scriptExecutor.js           # Carga y ejecuta snippets de JS.
+│   ├── configLoader.js             # Carga states.json.
+│   ├── fsm.js                      # Motor FSM: lógica de transición, ejecución de acciones con dependencias.
+│   ├── redisClient.js              # Cliente Redis: sesiones, streams, caché de tokens.
+│   └── templateProcessor.js        # Procesa plantillas ({{...}}).
+├── env.example                     # Variables de entorno.
+├── package.json                    # Dependencias.
+└── README.md, AGENTS.md            # Documentación principal.
 ```
 
 ## Módulos Detallados y Flujo
 
 ### 1. `package.json`
-   - Añadidas `axios` (llamadas HTTP) y `uuid` (correlation IDs).
+   - Dependencias principales: `axios`, `uuid`, `ioredis`, `pino`.
 
 ### 2. `config/api_definitions/` y `src/apiConfigLoader.js`
-   - `api_definitions/`: Contiene archivos JSON por API, definiendo `apiId`, `url`, `method`, plantillas para `headers`, `body_template`, `query_params_template`, `timeout_ms`, y `response_stream_key_template`.
-   - `apiConfigLoader.js`: Carga estas definiciones en memoria al inicio. Provee `getApiConfigById(apiId)`.
+   - `api_definitions/`: Archivos JSON por API. Ahora pueden incluir una sección `authentication` que referencia un `authProfileId` y define `tokenPlacement` (cómo usar el token).
+   - `apiConfigLoader.js`: Carga estas definiciones. La función `getApiConfigById()` ahora devuelve un mapa de todas las configuraciones si no se pasa un ID.
 
-### 3. `src/apiCallerService.js` (Actualizado)
-   - `prepareRequestConfig()`: Función interna para procesar plantillas en URL, headers, body, query_params.
-   - `makeRequestAndWait(apiId, sessionId, correlationId, params)`:
-     - Usa `prepareRequestConfig`.
-     - Ejecuta la llamada HTTP con `await axios()`.
-     - Devuelve `{ status: 'success', data: ..., httpCode: ... }` o `{ status: 'error', errorMessage: ..., httpCode: ..., isTimeout: ... }`.
-     - Usado por `fsm.js` para APIs en `synchronousCallSetup`.
-   - `makeRequestAsync(apiId, sessionId, correlationId, params)`:
-     - Usa `prepareRequestConfig`.
-     - Ejecuta `axios()` sin `await` (fire-and-forget).
-     - Registra el despacho. La respuesta real es manejada por un worker externo que escribe al Redis Stream.
-     - Usado por `fsm.js` para APIs en `asynchronousCallDispatch`.
+### 3. `config/auth_profiles/` y `src/authProfileLoader.js` (Nuevos)
+   - `auth_profiles/`: Directorio con perfiles de autenticación JSON (ej. para Bearer Tokens). Cada perfil especifica cómo generar/obtener un token (`tokenGenerationDetails` que referencia una `apiId`) y cómo cachearlo (`tokenCacheSettings`).
+   - `authProfileLoader.js`: Carga estos perfiles.
 
-### 4. `src/redisClient.js` (Actualizado)
-   - Mantiene un cliente principal y un `subscriberClient` para operaciones bloqueantes de streams.
-   - Funciones añadidas/mejoradas: `xadd`, `xreadgroup`, `xack`, `xgroupCreate`.
-   - Mejor manejo de conexión/desconexión y logging.
+### 4. `src/authService.js` (Nuevo)
+   - Lógica central para la gestión de tokens:
+     - `getValidToken(authProfileId, currentParameters, sessionData, sessionIdForLog)`:
+       - Carga el perfil de autenticación.
+       - Verifica la caché de Redis para un token válido.
+       - Si no hay token válido, llama a la API generadora de tokens (definida en el perfil) usando `apiCallerService.makeRequestAndWait()`.
+       - Extrae el token y su información de expiración de la respuesta.
+       - Guarda el nuevo token en la caché de Redis con un TTL apropiado.
+       - Devuelve el token (`{ tokenValue, tokenType }`).
 
-### 5. `config/states.json` y `src/configLoader.js`
-   - `states.json`:
-     - `payloadResponse.apiHooks.synchronousCallSetup`: Array de `apiId`s. Estas APIs son llamadas por el servidor FSM, y sus respuestas se esperan **dentro del mismo turno de conversación**.
-     - `payloadResponse.apiHooks.asynchronousCallDispatch`: Array de `apiId`s (o definiciones más ricas si se adaptan). Estas APIs son llamadas por el servidor FSM de forma asíncrona (fire-and-forget). Sus respuestas se esperan en un **turno subsecuente** a través de Redis Streams.
-     - Plantillas `{{...}}` pueden ahora usar `{{sync_api_results.apiId.field}}` para acceder a resultados de llamadas síncronas del turno actual, y `{{async_api_results.apiId.field}}` (o similar, dependiendo de cómo `index.js` los guarde) para resultados de llamadas asíncronas de turnos anteriores. `customInstructions` para la IA pueden también usar estos.
-   - `configLoader.js`: Carga `states.json`.
+### 5. `src/apiCallerService.js` (Actualizado)
+   - `makeRequestAndWait()` y `makeRequestAsync()` ahora aceptan `sessionData`.
+   - Antes de construir la configuración final de `axios` con `prepareRequestConfig()`:
+     - Verifican si la `apiConfig` tiene una sección `authentication`.
+     - Si es así, llaman a `authService.getValidToken()`.
+     - Si se obtiene un token, se añade a la `requestConfig` (ej. cabecera `Authorization: Bearer <token>`) según `tokenPlacement`.
+     - Si no se obtiene un token para una API que lo requiere, `makeRequestAndWait` devuelve un error estructurado (`isAuthError: true`); `makeRequestAsync` actualmente despacha la llamada sin token (lo que probablemente causará un fallo en el servidor API).
+   - `prepareRequestConfig()` ahora también recibe `sessionData` por si las plantillas de la API de token necesitaran acceder a ella (aunque es menos común).
 
-### 6. `src/fsm.js` (`processInput` Refactorizado)
-   - **Fase 1: Inicialización y Determinación de Estado Objetivo para APIs Síncronas**:
-     - Carga sesión (que incluye `parameters`, `sync_api_results`, `pendingApiResponses`).
-     - Fusiona `inputParameters` (de la IA) con `sessionData.parameters`.
-     - Determina el `targetStateIdForSyncApis` (estado actual, o el siguiente si hay una transición por `intent` inmediata).
-   - **Fase 2: Ejecución de APIs Sincrónicas (`synchronousCallSetup`)**:
-     - Si `targetStateConfigForSyncApis.payloadResponse.apiHooks.synchronousCallSetup` existe:
-       - Para cada `apiId`: Llama `apiCallerService.makeRequestAndWait()`.
-       - Resultados (éxito o error estructurado) se guardan en `currentParameters.sync_api_results[apiId]`. `sessionData.parameters` se actualiza.
-       - Errores críticos aquí podrían llevar a un estado de error FSM.
-   - **Fase 3: Lógica de Transición FSM Principal**:
-     - Determina `nextStateId` final y `finalNextStateConfig` basado en `effectiveIntent` y `currentParameters` (que ahora incluyen `sync_api_results`).
-   - **Fase 4: Renderizado de `payloadResponse`**:
-     - El `payloadResponse` del `finalNextStateConfig` se renderiza usando `templateProcessor` con `currentParameters`. Plantillas aquí pueden acceder a `{{sync_api_results...}}`, `{{async_api_results...}}` (si `index.js` los puso en `currentParameters`), y parámetros normales.
-   - **Fase 5: Despacho de APIs Asíncronas (`asynchronousCallDispatch`)**:
-     - Si `finalNextStateConfig.payloadResponse.apiHooks.asynchronousCallDispatch` existe:
-       - Para cada `apiId`:
-         - Genera `correlationId` con `uuidv4()`.
-         - (Opcional: si `assignCorrelationIdTo` está en la definición, guarda el `correlationId` en `currentParameters`).
-         - Obtiene `response_stream_key_template` de la config de la API, la renderiza.
-         - Almacena `{ apiId, responseStreamKey, requestedAt }` en `sessionData.pendingApiResponses[correlationId]`.
-         - Llama a `apiCallerService.makeRequestAsync()` (fire-and-forget).
-   - **Guardado de Sesión**: `sessionData` (con todos los parámetros, `sync_api_results`, `pendingApiResponses` actualizados) se guarda en Redis.
-   - Devuelve la estructura de respuesta FSM.
+### 6. `src/scriptExecutor.js`
+   - Ejecuta scripts de `config/scripts/`.
+   - Los scripts reciben `currentParameters`, `logger`, `sessionId`.
+   - Interpreta retornos estructurados de scripts: `{ status: "SUCCESS" | "ERROR" | "FORCE_TRANSITION", output, message, errorCode, transitionDetails }`.
 
-### 7. `src/index.js` (`handleInputWithAI` Actualizado)
-   - **Manejo de Entrada**: Acepta texto o JSON `{ userInput, waitForCorrelationId, initialCall }`.
-   - **Carga de Sesión**: Llama `fsm.initializeOrRestoreSession()`. `currentParameters` se inicializa desde `sessionData.parameters`.
-   - **Procesamiento de Respuestas Asíncronas de Streams**:
-     - **Si `waitForCorrelationId`**: Llama a `processSingleAwaitedApiResponse()`:
-       - Hace `XREADGROUP ... BLOCK` en el stream de respuesta esperado (de `sessionData.pendingApiResponses`).
-       - Procesa el mensaje (éxito/error/timeout), lo añade a `fullTextInputForAI`, actualiza `currentParameters.async_api_results.{apiId}_data` o `_error`. Hace `XACK`. Elimina de `pendingApiResponses`.
-       - Si hay timeout del `BLOCK`, añade contexto de timeout a `fullTextInputForAI` y `currentParameters`.
-     - **Otras Respuestas Pendientes**: Llama a `checkNonAwaitedApiResponses()`:
-       - Itera `pendingApiResponses`, hace `XREADGROUP` con timeout corto en cada stream. Procesa, combina, ACKea y actualiza similarmente.
-   - **Guardado Intermedio de Sesión**: Si `pendingApiResponses` o `currentParameters` cambiaron debido a respuestas de streams, se guarda `sessionData`.
-   - **Llamada a IA**: `aiService.getAIResponse(fullTextInputForAI, aiPromptContent)`.
-   - **Validación de IA**.
-   - **Llamada Principal a FSM**: `fsm.processInput(sessionId, aiIntent, aiParametersFromAI, initialCallFlag)`.
-     - Nota: `fsm.processInput` recibe los `aiParameters` y los fusiona con los `currentParameters` de la sesión (que ya incluyen `async_api_results`). Luego `fsm.processInput` añade `sync_api_results`.
-   - Registra E/S en Redis. Devuelve resultado FSM.
+### 7. `src/redisClient.js`
+   - Usado para sesiones FSM, streams de respuestas API asíncronas, y ahora también por `AuthService` para cachear tokens de autenticación.
 
-### 8. `config/aiPrompt.txt` (Actualizado)
-   - Incluye instrucciones para que la IA use:
-     - Datos de `customInstructions` que pueden contener `{{sync_api_results...}}` (ya renderizados cuando la IA los ve).
-     - Contexto de `[API Response Context ...]` o `[API Error Context ...]` para resultados de llamadas asíncronas de turnos anteriores.
+### 8. `config/states.json` y `src/configLoader.js`
+   - **`states.json`**:
+     - Cada estado ahora tiene un objeto `stateLogic` que contiene:
+       - `awaitsUserInputParameters` (opcional): Parámetros que la IA debe extraer para este estado.
+       - `onEntry` (Array de Objetos de Acción, opcional): Acciones (API o Script) a ejecutar al entrar.
+         - Cada acción define: `label` (opcional), `type`, `id`, `executionMode` ("SYNCHRONOUS" o "ASYNCHRONOUS"), `ignoreIfOutputExists` (opcional), `runIfCondition` (opcional, para ejecución condicional), y campos específicos (ej. `filePath`, `functionName`, `assignResultTo` para scripts; `consumesParameters` opcional para scripts).
+       - `dataRequirementsForPrompt` (Array de Strings, opcional): Parámetros críticos para los prompts/customInstructions del estado.
+   - **`configLoader.js`**: Carga `states.json`. `getAllStates()` provee todas las configuraciones de estado.
 
-### 9. `scripts/simulateApiResponder.js` (Actualizado)
-   - Herramienta CLI: `node scripts/simulateApiResponder.js <responseStreamKey> <sessionId> <correlationId> <apiId> [status] [httpCode] [customDataJsonString]`.
-   - Usa `redisClient.xadd()` para escribir un mensaje formateado (ver Plan Paso 5 para formato) al `responseStreamKey` especificado. Simula un worker externo que responde a una llamada API.
+### 9. `src/fsm.js` (`processInput` Refactorizado)
+   - **Gestión de Sesión**: `initializeOrRestoreSession` inicializa `conversationHistory`.
+   - **Flujo de Procesamiento Principal**:
+     1.  **Determinar Estado Objetivo (`candidateNextStateId`)**: Basado en `intent` y `awaitsUserInputParameters` del estado actual.
+     2.  **Recopilar Acciones `onEntry` y por `dataRequirementsForPrompt`**:
+         - Se reúnen las acciones `onEntry` de los estados a procesar (saltados + candidato).
+         - Se analizan los prompts/customInstructions del `candidateNextStateConfig` para identificar `{{params}}` necesarios. Si un `param` falta y una API lo produce, se añade una acción API síncrona para obtenerlo.
+     3.  **Planificar y Ejecutar Acciones Síncronas (usando Grafo y Orden Topológico)**:
+         - `buildSyncActionGraph()`: Crea un grafo de dependencias para las acciones síncronas (APIs y Scripts). Las dependencias se basan en `consumesParameters` (de `api_definitions/` o de la acción de script) y `producesParameters` (de `api_definitions/`) o `assignResultTo` (de scripts). Identifica tareas irresolubles por `USER_INPUT` faltante.
+         - `topologicalSort()`: Ordena las tareas resolubles. Detecta ciclos.
+         - Se ejecutan las tareas en orden. `executeSingleAction()` maneja la llamada real a API (vía `apiCallerService`) o script (vía `scriptExecutor`), y actualiza `currentParameters` con los resultados.
+         - `runIfCondition` se verifica antes de intentar ejecutar una acción.
+     4.  **Despachar Acciones Asíncronas `onEntry`**: Se despachan si sus dependencias se cumplen. `waitForResultConfig` se guarda en `pendingApiResponses`.
+     5.  **Transición Final y `onTransition` Actions**: Se actualiza el estado de la sesión. Se ejecutan acciones `onTransition` del estado origen.
+     6.  **Renderizar `payloadResponse`**: Del estado final, usando `currentParameters` actualizados.
+   - **Funciones Clave**: `extractTemplateParams`, `getActionDependencies`, `executeSingleAction`, `buildSyncActionGraph`, `topologicalSort`.
+
+### 10. `src/index.js` (`handleInputWithAI`)
+   - **Construcción del Prompt para IA**:
+     - Recupera `customInstructions` del estado FSM actual (de `sessionData.currentStateId`), las renderiza con `sessionData.parameters`, y las antepone al `userInputText` antes de llamar a `aiService.getAIResponse`.
+     - (Recomendación pendiente de implementar por el usuario): Añadir historial de conversación y parámetros recolectados al prompt.
+   - **Manejo de `waitForResult` (Lógica a implementar por el usuario en `index.js`):**
+     - Al inicio, antes de llamar a la IA, `index.js` debería iterar `sessionData.pendingApiResponses`.
+     - Para las que tengan `waitForResultConfig.point === "BEFORE_AI_PROMPT_NEXT_TURN"`, realizar `XREADGROUP` bloqueante.
+     - Procesar la respuesta o el `onTimeoutFallback`, actualizando `currentParameters`.
+     - Guardar la sesión antes de construir el prompt de IA.
+   - Pasa `sessionId` a `aiService.getAIResponse`.
+   - (Recomendación pendiente de implementar por el usuario): Poblar `sessionData.conversationHistory`.
+
+### 11. `config/aiPrompt.txt` y `scripts/simulateApiResponder.js` y `env.example`
+   - Sin cambios funcionales directos en `aiPrompt.txt`, pero se beneficia del prompt más rico.
+   - `simulateApiResponder.js` usa `MAXLEN`.
+   - `env.example` incluye `REDIS_SESSION_TTL`, `SIMULATOR_STREAM_MAXLEN`.
 
 ---
 *Fin del documento.*
