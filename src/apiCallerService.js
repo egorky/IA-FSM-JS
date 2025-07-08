@@ -1,9 +1,13 @@
 // src/apiCallerService.js
 const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 const logger = require('./logger');
-const { getApiConfigById: getOriginalApiConfigById } = require('./apiConfigLoader'); // Renombrar para evitar conflicto
+const { getApiConfigById: getOriginalApiConfigById, getAllApiConfigs } = require('./apiConfigLoader'); // Renombrar para evitar conflicto y añadir getAll
 const { processTemplate } = require('./templateProcessor');
 const authService = require('./authService'); // NUEVO IMPORT
+const redisClient = require('./redisClient'); // NUEVO IMPORT para DEMO_MODE async
+
+const DEMO_MODE = process.env.DEMO_MODE === 'true';
 
 // Wrapper para asegurar que la config de API siempre se cargue
 function getApiConfigById(apiId) {
@@ -97,10 +101,25 @@ async function makeRequestAsync(apiId, sessionId, correlationId, collectedParame
     return false;
   }
 
-  logger.info({ apiId, sessionId, correlationId, url: apiConfig.url }, 'apiCallerService.makeRequestAsync: Preparing to dispatch.');
+  logger.info({ apiId, sessionId, correlationId, url: apiConfig.url, DEMO_MODE }, 'apiCallerService.makeRequestAsync: Preparing to dispatch.');
 
+  // In DEMO_MODE, for async calls that are NOT token generation, we will make a real HTTP call to the local demo server.
+  // The local demo server will then be responsible for putting a message on the Redis Stream.
+  // Token generation APIs (if async, though unusual) would be handled differently if needed,
+  // but typically token gen is sync. For now, all async go to demo server if DEMO_MODE.
+
+  // Actual API call logic (targets demo server if DEMO_MODE is true and URL was overridden by apiConfigLoader)
   try {
     let requestConfig = prepareRequestConfig(apiConfig, sessionId, correlationId, collectedParameters, sessionData);
+
+    if (DEMO_MODE && apiConfig.response_stream_key_template) { // If it's an async call in demo mode
+        requestConfig.headers = {
+            ...requestConfig.headers,
+            'X-Session-ID': sessionId,
+            'X-Correlation-ID': correlationId,
+        };
+        logger.debug({ apiId, sessionId, correlationId }, "DEMO_MODE: Added X-Session-ID and X-Correlation-ID headers for async call to demo server.");
+    }
 
     if (apiConfig.authentication && apiConfig.authentication.authProfileId) {
       logger.debug({ apiId, sessionId, authProfileId: apiConfig.authentication.authProfileId }, "API requires authentication (async).");
@@ -159,8 +178,29 @@ async function makeRequestAndWait(apiId, sessionId, correlationId, collectedPara
     return { status: 'error', errorMessage: 'API configuration not found', httpCode: null, isTimeout: false, data: null, isAuthError: false };
   }
 
-  logger.info({ apiId, sessionId, correlationId, url: apiConfig.url }, 'apiCallerService.makeRequestAndWait: Preparing and making synchronous request.');
+  logger.info({ apiId, sessionId, correlationId, url: apiConfig.url, DEMO_MODE }, 'apiCallerService.makeRequestAndWait: Preparing and making synchronous request.');
 
+  if (DEMO_MODE && (apiId === 'api_generate_token' || apiId === 'api_generate_system_token')) {
+    logger.warn({ apiId, sessionId, correlationId }, 'DEMO_MODE: Simulating synchronous API response for TOKEN GENERATION.');
+    // Special handling for token generation API in DEMO_MODE - return hardcoded token
+    return {
+        status: 'success',
+        httpCode: 200,
+        data: { // Consistent with producesParameters of api_generate_token.json
+            access_token: 'DEMO_ACCESS_TOKEN_12345_67890',
+            expires_in: 3600,
+            token_type: 'Bearer',
+            scope: 'read write demo_scope'
+        },
+        errorMessage: null,
+        isTimeout: false,
+        isDemoAuthToken: true // Mark that this is a demo auth token
+    };
+  }
+  // For other APIs in DEMO_MODE, or if not in DEMO_MODE at all, proceed to actual call.
+  // If DEMO_MODE is true, the URL in requestConfig will point to the local demo server.
+
+  // Actual API call logic (targets demo server if DEMO_MODE is true and URL was overridden)
   try {
     let requestConfig = prepareRequestConfig(apiConfig, sessionId, correlationId, collectedParameters, sessionData);
 

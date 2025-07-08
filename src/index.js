@@ -8,8 +8,10 @@ const { startApiServer } = require('./apiServer');
 const { startSocketServer, stopSocketServer } = require('./socketServer');
 const redisClient = require('./redisClient');
 const { connectAri, closeAri } = require('./ariClient');
+const { startDemoServers, stopDemoServers } = require('./demoApiServers'); // For DEMO_MODE
 const fsm = require('./fsm'); // Contains FSM_SESSION_PREFIX, initializeOrRestoreSession, processInput, saveSessionAsync
 const { loadStateConfig, getStateById } = require('./configLoader');
+const { getAllApiConfigs: getAllApiConfigsForDemo } = require('./apiConfigLoader'); // For demo mode
 const { processTemplate } = require('./templateProcessor'); // Added templateProcessor
 const aiService = require('./aiService');
 const jsonValidator = require('./jsonValidator');
@@ -19,6 +21,9 @@ const PROMPT_PATH = path.join(__dirname, '../config/aiPrompt.txt');
 let aiPromptContent = '';
 const CONSUMER_GROUP_NAME = process.env.REDIS_STREAM_CONSUMER_GROUP || 'fsm_ai_group';
 const CONSUMER_NAME_PREFIX = process.env.REDIS_STREAM_CONSUMER_NAME_PREFIX || `fsm_consumer_${uuidv4()}`;
+// DEMO_MODE is now imported from configConstants to ensure it's the same source of truth
+const { DEMO_MODE } = require('./configConstants');
+
 
 function loadAIPrompt() {
   try {
@@ -475,6 +480,11 @@ async function main() {
     await redisClient.getSubscriberClient();
     logger.info('Redis clients (main & subscriber) connected.');
 
+    if (DEMO_MODE) {
+      await new Promise(resolve => startDemoServers(resolve));
+      logger.info("Demo API servers started as DEMO_MODE is active.");
+    }
+
     const enableApi = process.env.ENABLE_API !== 'false';
     if (enableApi) startApiServer(handleInputWithAI);
     else logger.info('API module disabled.');
@@ -505,6 +515,12 @@ async function main() {
 
 async function shutdown(signal) {
   logger.info({signal}, `Shutting down FSM application due to ${signal}...`);
+
+  if (DEMO_MODE) {
+    await new Promise(resolve => stopDemoServers(resolve));
+    logger.info("Demo API servers stopped.");
+  }
+
   if (process.env.ENABLE_ARI !== 'false') await closeAri().catch(err => logger.error({ err }, 'Error closing ARI'));
   if (process.env.ENABLE_SOCKET_SERVER !== 'false' && process.env.FSM_SOCKET_PATH) {
       await stopSocketServer(process.env.FSM_SOCKET_PATH).catch(err => logger.error({ err }, 'Error closing Socket Server'));

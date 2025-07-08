@@ -80,3 +80,70 @@ node scripts/simulateApiResponder.js api_responses_stream:sessExample:corr123 se
 
 ## Documentación Detallada
 Consulte `docs/CodebaseOverview.md` y `FSM_Documentation.md`.
+
+## Modo Demo (`DEMO_MODE`)
+
+El servicio incluye un `DEMO_MODE` para desarrollo y pruebas sin necesidad de conectar con APIs externas reales o incurrir en costos de servicios de IA.
+
+**Para activar el `DEMO_MODE`:**
+Establezca la variable de entorno `DEMO_MODE` a `"true"` en su archivo `.env`:
+```
+DEMO_MODE="true"
+```
+Opcionalmente, puede configurar el puerto base para los servidores API de demostración:
+```
+DEMO_API_BASE_PORT="7080" # Puerto por defecto si no se especifica
+```
+
+**Funcionamiento en `DEMO_MODE`:**
+
+1.  **Servidores API de Demostración Locales**:
+    *   Al iniciar, la aplicación levantará servidores HTTP locales (usando Express.js, configurados en `src/demoApiServers.js`) que simularán las APIs externas definidas en `config/api_definitions/`.
+    *   Estos servidores escucharán en el puerto especificado por `DEMO_API_BASE_PORT` (por defecto `7080`). Por ejemplo, una API definida con `url_template: "https://api.example.com/users/{{params.userId}}"` será accesible en `http://127.0.0.1:7080/users/:userId` en modo demo.
+    *   Las URLs en las configuraciones de API cargadas son automáticamente reescritas por `src/apiConfigLoader.js` para apuntar a estos servidores locales.
+
+2.  **Simulación de Llamadas API**:
+    *   **APIs Síncronas**:
+        *   Las llamadas a APIs síncronas (ej. para obtener un token de autenticación, o datos críticos para el turno actual) serán dirigidas a los servidores de demostración locales.
+        *   La API de generación de tokens (`api_generate_token` o `api_generate_system_token`) devolverá un token ficticio (ej. `DEMO_ACCESS_TOKEN_12345_67890`).
+        *   Otras APIs síncronas devolverán datos de ejemplo predefinidos o generados dinámicamente por el servidor de demostración correspondiente.
+    *   **APIs Asíncronas**:
+        *   Las llamadas a APIs asíncronas también se dirigirán a los servidores de demostración locales.
+        *   El servidor de demostración, al recibir una solicitud para una API asíncrona:
+            *   Devolverá una respuesta HTTP inmediata (ej. `202 Accepted`).
+            *   Posteriormente, escribirá un mensaje simulando la respuesta real de la API al flujo (stream) de Redis apropiado (definido en `response_stream_key_template` de la API). Esto permite que el ciclo de procesamiento de respuestas asíncronas de la FSM (`processStreamResponsesAndUpdateContext` en `src/index.js`) funcione como si una API externa real hubiera respondido.
+            *   Utilizará las cabeceras `X-Session-ID` y `X-Correlation-ID` (enviadas por `apiCallerService.js` en modo demo) para construir la clave del stream y el mensaje.
+
+3.  **Autenticación**:
+    *   El `AuthService` obtendrá el token ficticio del servidor de demostración de generación de tokens y lo cacheará.
+    *   Cuando se llame a una API protegida, `apiCallerService.js` adjuntará este token ficticio a la cabecera `Authorization`.
+    *   Los servidores de demostración para APIs protegidas realizarán una verificación simplificada de este token ficticio, devolviendo un error 401/403 si no es válido o falta.
+
+4.  **Servicio de IA**:
+    *   El `DEMO_MODE` **no** simula directamente las respuestas del servicio de IA (`aiService.js`). El servicio de IA seguirá intentando contactar al proveedor configurado (OpenAI, Google, Groq).
+    *   Para evitar costos o errores de IA durante el `DEMO_MODE`, se recomienda:
+        *   No configurar claves API para los proveedores de IA en el archivo `.env`.
+        *   O bien, usar un proveedor de IA local o un mock configurado directamente en `aiService.js` si se necesita un comportamiento específico de la IA para las pruebas en modo demo.
+        *   Alternativamente, se puede modificar `handleInputWithAI` en `src/index.js` para que, si `DEMO_MODE` está activo, se salte la llamada a `aiService.getAIResponse` y en su lugar devuelva un `intent` y `parameters` predefinidos o basados en reglas simples sobre `userInputText`. (Esta modificación no está incluida por defecto).
+
+**Uso para Pruebas con `curl`**:
+En `DEMO_MODE`, puede interactuar con la FSM a través de su API REST (generalmente en `http://127.0.0.1:3000` si `ENABLE_API="true"` y `PORT=3000`).
+
+Ejemplo de inicio de conversación (reemplace `your_session_id` con un ID único):
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{
+  "userInput": "Hola",
+  "initialCall": true
+}' http://127.0.0.1:3000/fsm/your_session_id
+```
+
+Siguientes interacciones:
+```bash
+curl -X POST -H "Content-Type: text/plain" -d "Mi número de cédula es 1234567890" http://127.0.0.1:3000/fsm/your_session_id
+```
+Observe los logs de la aplicación para ver las llamadas a los servidores API de demostración y el flujo de la FSM.
+Los servidores de demostración también registrarán las solicitudes que reciben.
+```
+
+## Documentación Detallada
+Consulte `docs/CodebaseOverview.md` y `FSM_Documentation.md`.
