@@ -145,5 +145,43 @@ Observe los logs de la aplicación para ver las llamadas a los servidores API de
 Los servidores de demostración también registrarán las solicitudes que reciben.
 ```
 
+### Configuración de Archivos para DEMO_MODE
+
+Para que `DEMO_MODE` funcione correctamente con APIs simuladas, necesitarás crear archivos de configuración específicos para este modo:
+
+1.  **Crear Directorio para Definiciones de API de Demostración:**
+    *   Dentro del directorio `config/`, crea un nuevo subdirectorio llamado `api_definitions_demo`.
+    *   Estructura esperada: `config/api_definitions_demo/`
+
+2.  **Poblar `api_definitions_demo/`:**
+    *   Copia los archivos JSON de definición de API que desees simular desde `config/api_definitions/` al nuevo directorio `config/api_definitions_demo/`.
+    *   **Importante**: Para cada archivo JSON copiado en `config/api_definitions_demo/`, debes modificar el campo `url_template` para que apunte al servidor de demostración local.
+        *   El servidor de demostración (`demoApiServers.js`) se ejecuta en `http://127.0.0.1` en el puerto definido por `DEMO_API_BASE_PORT` (por defecto `7080`).
+        *   El path de la URL debe coincidir con el path original de la API.
+        *   **Ejemplo**: Si en `config/api_definitions/api_get_user_profile.json` tienes:
+            ```json
+            "url_template": "https://my.real.api.com/users/{{params.userId}}/profile"
+            ```
+            En `config/api_definitions_demo/api_get_user_profile.json` deberías cambiarlo a:
+            ```json
+            "url_template": "http://127.0.0.1:7080/users/{{params.userId}}/profile"
+            ```
+        *   Si `DEMO_MODE` está activo y el directorio `config/api_definitions_demo/` existe y contiene definiciones, estas serán usadas. Si el directorio demo no existe o está vacío, el sistema usará las definiciones de `config/api_definitions/` como fallback (verás una advertencia en los logs).
+
+3.  **Crear Archivo de Estados de Demostración (`states.demo.json`):**
+    *   En el directorio `config/`, crea un archivo llamado `states.demo.json`.
+    *   Puedes empezar copiando el contenido de tu `config/states.json` actual a `states.demo.json`.
+    *   Este archivo `states.demo.json` será cargado por la FSM cuando `DEMO_MODE` esté activo.
+    *   Puedes modificar `states.demo.json` para:
+        *   Referenciar `apiId`s cuyas definiciones en `config/api_definitions_demo/` apuntan a los servidores demo.
+        *   Ajustar la lógica de los estados, prompts, o transiciones específicamente para tus escenarios de prueba en `DEMO_MODE` si es necesario.
+    *   Si `DEMO_MODE` está activo y `config/states.demo.json` no se encuentra, el sistema usará `config/states.json` como fallback (verás una advertencia en los logs).
+
+**Resumen de Carga en `DEMO_MODE`:**
+*   **Definiciones de API**: Prioridad a `config/api_definitions_demo/`. Fallback a `config/api_definitions/`.
+*   **Configuración de Estados FSM**: Prioridad a `config/states.demo.json`. Fallback a `config/states.json`.
+
+Asegúrate de que los `apiId` en tu `states.demo.json` coincidan con los `apiId` de los archivos que has configurado en `config/api_definitions_demo/`.
+
 ## Documentación Detallada
 Consulte `docs/CodebaseOverview.md` y `FSM_Documentation.md`.

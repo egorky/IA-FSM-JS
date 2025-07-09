@@ -2,67 +2,73 @@
 const fs = require('fs');
 const path = require('path');
 const logger = require('./logger');
-const { DEMO_MODE, DEMO_API_BASE_PORT } = require('./configConstants');
+const { DEMO_MODE } = require('./configConstants'); // DEMO_API_BASE_PORT no longer needed here
 
-const API_DEFINITIONS_DIR = path.join(__dirname, '../config/api_definitions');
+const STANDARD_API_DEFINITIONS_DIR = path.join(__dirname, '../config/api_definitions');
+const DEMO_API_DEFINITIONS_DIR = path.join(__dirname, '../config/api_definitions_demo');
 let apiConfigurations = {}; // Cache for loaded API configurations
 
 /**
- * Loads all API definition JSON files from the config/api_definitions directory.
+ * Loads all API definition JSON files from the appropriate directory based on DEMO_MODE.
  * Parses them and stores them in the apiConfigurations cache.
- * If DEMO_MODE is active, it overrides url_template to point to local demo servers.
  */
 function loadAllApiConfigs() {
+  let definitionsDirToLoad = STANDARD_API_DEFINITIONS_DIR;
+  let mode = "STANDARD";
+
+  if (DEMO_MODE) {
+    if (fs.existsSync(DEMO_API_DEFINITIONS_DIR)) {
+      const demoFiles = fs.readdirSync(DEMO_API_DEFINITIONS_DIR).filter(f => path.extname(f) === '.json');
+      if (demoFiles.length > 0) {
+        definitionsDirToLoad = DEMO_API_DEFINITIONS_DIR;
+        mode = "DEMO";
+        logger.info(`DEMO_MODE: Loading API definitions from ${DEMO_API_DEFINITIONS_DIR}`);
+      } else {
+        logger.warn(`DEMO_MODE: Directory ${DEMO_API_DEFINITIONS_DIR} is empty. Falling back to standard API definitions.`);
+      }
+    } else {
+      logger.warn(`DEMO_MODE: Directory ${DEMO_API_DEFINITIONS_DIR} not found. Falling back to standard API definitions.`);
+    }
+  }
+
   try {
-    if (!fs.existsSync(API_DEFINITIONS_DIR)) {
-      logger.warn(`API definitions directory not found: ${API_DEFINITIONS_DIR}. No external APIs will be configured.`);
+    if (!fs.existsSync(definitionsDirToLoad)) {
+      logger.warn(`API definitions directory not found: ${definitionsDirToLoad}. No external APIs will be configured.`);
       apiConfigurations = {};
       return;
     }
 
-    const files = fs.readdirSync(API_DEFINITIONS_DIR);
+    const files = fs.readdirSync(definitionsDirToLoad);
     const tempConfigs = {};
 
     files.forEach(file => {
       if (path.extname(file) === '.json') {
-        const filePath = path.join(API_DEFINITIONS_DIR, file);
+        const filePath = path.join(definitionsDirToLoad, file);
         try {
           const fileContent = fs.readFileSync(filePath, 'utf-8');
-          let config = JSON.parse(fileContent);
+          const config = JSON.parse(fileContent); // No URL overriding here
           if (config.apiId) {
-            if (DEMO_MODE && config.url_template) {
-              try {
-                const originalUrl = new URL(config.url_template.startsWith('http') ? config.url_template : `http://dummybase.com${config.url_template}`);
-                const demoPath = originalUrl.pathname;
-                const newDemoUrl = `http://127.0.0.1:${DEMO_API_BASE_PORT}${demoPath}`;
-                logger.info({ apiId: config.apiId, original: config.url_template, new: newDemoUrl }, "DEMO_MODE: Overriding API URL to local demo server.");
-                config.url_template = newDemoUrl; // Override URL
-                config.isDemoOverridden = true; // Mark as overridden
-              } catch (urlParseError) {
-                logger.error({ apiId: config.apiId, url_template: config.url_template, err: urlParseError }, "DEMO_MODE: Failed to parse and override URL for demo server. Using original.");
-              }
-            }
             tempConfigs[config.apiId] = config;
-            logger.debug(`Loaded API configuration for: ${config.apiId}${DEMO_MODE && config.isDemoOverridden ? ' (URL overridden for DEMO)' : ''}`);
+            logger.debug(`Loaded API configuration for: ${config.apiId} (Mode: ${mode})`);
           } else {
-            logger.warn(`API configuration file ${file} is missing 'apiId'. Skipping.`);
+            logger.warn(`API configuration file ${file} (Mode: ${mode}) is missing 'apiId'. Skipping.`);
           }
         } catch (error) {
-          logger.error({ err: error, file: filePath }, `Error parsing API configuration file.`);
+          logger.error({ err: error, file: filePath, mode }, `Error parsing API configuration file.`);
         }
       }
     });
     apiConfigurations = tempConfigs; // Atomic update of the cache
-    logger.info(`Successfully loaded ${Object.keys(apiConfigurations).length} API configurations.${DEMO_MODE ? ' (DEMO_MODE active, URLs may be overridden)' : ''}`);
+    logger.info(`Successfully loaded ${Object.keys(apiConfigurations).length} API configurations (Mode: ${mode}).`);
   } catch (error) {
-    logger.error({ err: error, directory: API_DEFINITIONS_DIR }, 'Error reading API definitions directory.');
+    logger.error({ err: error, directory: definitionsDirToLoad, mode }, 'Error reading API definitions directory.');
     apiConfigurations = {}; // Reset cache on error
   }
 }
 
 /**
  * Retrieves a specific API configuration by its ID.
- * If DEMO_MODE is active, the returned config may have its url_template overridden.
+ * The configuration loaded depends on DEMO_MODE (from demo or standard directory).
  * @param {string} apiId - The ID of the API configuration to retrieve.
  * @returns {object | undefined} The API configuration object, or undefined if not found.
  */

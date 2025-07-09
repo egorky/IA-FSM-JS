@@ -151,18 +151,44 @@ async function makeRequestAsync(apiId, sessionId, correlationId, collectedParame
 
     axios(requestConfig)
       .then(response => {
-        logger.info({ apiId, sessionId, correlationId, status: response.status }, 'apiCallerService.makeRequestAsync: HTTP request dispatched (external worker handles response).');
+        logger.info({ apiId, sessionId, correlationId, status: response.status }, 'apiCallerService.makeRequestAsync: HTTP request successful. Writing to Redis Stream.');
+
+        const streamPayload = {
+          correlationId,
+          sessionId,
+          apiId,
+          status: 'success',
+          httpCode: response.status,
+          data: response.data,
+          isTimeout: false,
+          timestamp: new Date().toISOString()
+        };
+        writeToStream(apiConfig, streamPayload, collectedParameters);
       })
       .catch(error => {
+        const isTimeout = error.code === 'ECONNABORTED';
+        const httpCode = error.response?.status || null;
+        const responseData = error.response?.data || null;
         logger.error({
-          err: error.message, apiId, sessionId, correlationId,
-          isTimeout: error.code === 'ECONNABORTED',
-          responseData: error.response ? { status: error.response.status, data: error.response.data } : null
-        }, 'apiCallerService.makeRequestAsync: HTTP dispatch failed or resulted in error.');
+          err: error.message, apiId, sessionId, correlationId, isTimeout, httpCode, responseData
+        }, 'apiCallerService.makeRequestAsync: HTTP request failed or resulted in error. Writing error to Redis Stream.');
+
+        const streamPayload = {
+          correlationId,
+          sessionId,
+          apiId,
+          status: 'error',
+          httpCode: httpCode,
+          data: responseData,
+          errorMessage: error.message,
+          isTimeout: isTimeout,
+          timestamp: new Date().toISOString()
+        };
+        writeToStream(apiConfig, streamPayload, collectedParameters);
       });
-    return true; // Dispatch initiated
+    return true; // Dispatch and stream writing process initiated
   } catch (processingError) {
-    logger.error({ err: processingError, apiId, sessionId, correlationId }, 'apiCallerService.makeRequestAsync: Failed to prepare/process request config.');
+    logger.error({ err: processingError, apiId, sessionId, correlationId }, 'apiCallerService.makeRequestAsync: Failed to prepare/process request config. No stream message will be written.');
     return false;
   }
 }
@@ -259,3 +285,47 @@ module.exports = {
   makeRequestAsync,     // For fire-and-forget calls (responses via Redis Stream)
   makeRequestAndWait, // For calls where the FSM needs the response in the same turn
 };
+
+// Helper function to write API response/error to Redis Stream
+function writeToStream(apiConfig, streamPayload, collectedParameters) {
+  if (!apiConfig.response_stream_key_template) {
+    logger.error({ apiId: apiConfig.apiId, payload: streamPayload }, "Cannot write to stream: apiConfig.response_stream_key_template is missing.");
+    return;
+  }
+
+  const { sessionId, correlationId, apiId } = streamPayload;
+  const templateContextForStreamKey = { ...collectedParameters, sessionId, correlationId, apiId };
+  let responseStreamKey;
+  try {
+    responseStreamKey = processTemplate(apiConfig.response_stream_key_template, templateContextForStreamKey);
+  } catch (e) {
+    logger.error({ err: e, apiId, streamPayload }, "Failed to process response_stream_key_template. Cannot write to stream.");
+    return;
+  }
+
+  const messageFields = [];
+  for (const key in streamPayload) {
+    messageFields.push(key, JSON.stringify(streamPayload[key]));
+  }
+
+  const streamMaxLen = parseInt(process.env.SIMULATOR_STREAM_MAXLEN, 10) || 1000; // Default from env or 1000
+  const xaddArgs = [responseStreamKey];
+  if (streamMaxLen > 0) {
+    xaddArgs.push('MAXLEN', '~', streamMaxLen.toString());
+  }
+  xaddArgs.push('*', ...messageFields); // Append message ID and fields
+
+  const rawRedisClient = redisClient.getClient();
+  if (!rawRedisClient || typeof rawRedisClient.call !== 'function') {
+    logger.error({ apiId, streamKey: responseStreamKey }, "Could not get underlying Redis client or 'call' method to execute XADD with MAXLEN. Stream write may fail or not respect MAXLEN.");
+    // Fallback or alternative xadd if simple client.xadd is available and preferred for some reason
+    redisClient.xadd(responseStreamKey, '*', ...messageFields.slice(messageFields.indexOf('*') + 1)) // Assuming simple xadd takes fields directly
+        .then(messageId => logger.info({ responseStreamKey, messageId, apiId: apiConfig.apiId, status: streamPayload.status }, 'Successfully wrote to Redis Stream (fallback XADD).'))
+        .catch(err => logger.error({ err, responseStreamKey, apiId: apiConfig.apiId }, 'Error writing to Redis Stream (fallback XADD).'));
+    return;
+  }
+
+  rawRedisClient.call('XADD', ...xaddArgs)
+    .then(messageId => logger.info({ responseStreamKey, messageId, apiId: apiConfig.apiId, status: streamPayload.status }, 'Successfully wrote to Redis Stream.'))
+    .catch(err => logger.error({ err, responseStreamKey, apiId: apiConfig.apiId }, 'Error writing to Redis Stream.'));
+}

@@ -1,12 +1,15 @@
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger'); // Import logger
+const { DEMO_MODE } = require('./configConstants');
 
-const STATE_CONFIG_PATH = path.join(__dirname, '..', 'config', 'states.json');
+const STANDARD_STATE_CONFIG_PATH = path.join(__dirname, '..', 'config', 'states.json');
+const DEMO_STATE_CONFIG_PATH = path.join(__dirname, '..', 'config', 'states.demo.json');
 
 let stateConfiguration = null;
 
 /**
- * Carga la configuración de estados desde el archivo JSON.
+ * Carga la configuración de estados desde el archivo JSON apropiado (standard o demo).
  * @returns {object} La configuración de estados.
  * @throws {Error} Si el archivo de configuración no se encuentra o no es un JSON válido.
  */
@@ -15,11 +18,24 @@ function loadStateConfig() {
     return stateConfiguration;
   }
 
-  try {
-    if (!fs.existsSync(STATE_CONFIG_PATH)) {
-      throw new Error(`El archivo de configuración de estados no se encontró en: ${STATE_CONFIG_PATH}`);
+  let configPathToLoad = STANDARD_STATE_CONFIG_PATH;
+  let mode = "STANDARD";
+
+  if (DEMO_MODE) {
+    if (fs.existsSync(DEMO_STATE_CONFIG_PATH)) {
+      configPathToLoad = DEMO_STATE_CONFIG_PATH;
+      mode = "DEMO";
+      logger.info(`DEMO_MODE: Loading states configuration from ${DEMO_STATE_CONFIG_PATH}`);
+    } else {
+      logger.warn(`DEMO_MODE: File ${DEMO_STATE_CONFIG_PATH} not found. Falling back to standard states configuration: ${STANDARD_STATE_CONFIG_PATH}`);
     }
-    const rawConfig = fs.readFileSync(STATE_CONFIG_PATH, 'utf-8');
+  }
+
+  try {
+    if (!fs.existsSync(configPathToLoad)) {
+      throw new Error(`El archivo de configuración de estados no se encontró en: ${configPathToLoad}`);
+    }
+    const rawConfig = fs.readFileSync(configPathToLoad, 'utf-8');
     stateConfiguration = JSON.parse(rawConfig);
 
     // Validaciones básicas de la estructura
@@ -58,6 +74,13 @@ function loadStateConfig() {
     return stateConfiguration;
   } catch (error) {
     console.error('Error al cargar o validar la configuración de estados:', error);
+    // En un escenario real, podrías querer que la aplicación falle si no puede cargar la configuración.
+    // Por ahora, lanzamos el error para que se maneje más arriba o se detenga la app.
+    // Log final sobre el modo de carga
+    logger.info(`Configuración de estados cargada y validada exitosamente (Modo: ${mode}).`);
+    return stateConfiguration;
+  } catch (error) {
+    logger.error({ err: error, path: configPathToLoad, mode },'Error al cargar o validar la configuración de estados');
     // En un escenario real, podrías querer que la aplicación falle si no puede cargar la configuración.
     // Por ahora, lanzamos el error para que se maneje más arriba o se detenga la app.
     throw error;

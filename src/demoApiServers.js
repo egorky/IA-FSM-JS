@@ -160,45 +160,14 @@ function startDemoServers(callback) {
 
             const responseData = generateDemoDataForEndpoint(apiId, apiConfig, req.params, req.body, req.query);
 
-            // For ASYNC APIs in DEMO_MODE, the demo server itself should push to Redis stream
-            // We need to identify if the original API was meant to be async.
-            // We don't have direct access to the 'executionMode' from states.json here.
-            // Assumption: if response_stream_key_template exists, it's an async API.
-            if (apiConfig.response_stream_key_template) {
-                const sessionId = req.headers['x-session-id'] || req.query.sessionId || 'unknown_session_demo';
-                const correlationId = req.headers['x-correlation-id'] || req.query.correlationId || uuidv4();
-
-                const streamTemplateContext = { sessionId, correlationId, apiId, ...req.query, ...req.params };
-                const responseStreamKey = processTemplate(apiConfig.response_stream_key_template, streamTemplateContext);
-
-                const streamPayload = {
-                    correlationId,
-                    sessionId,
-                    apiId,
-                    status: 'success', // Assuming demo server always succeeds for now
-                    httpCode: 200,
-                    data: responseData,
-                    isDemoServerStream: true,
-                    timestamp: new Date().toISOString()
-                };
-                const messageFields = [];
-                for (const key in streamPayload) {
-                    messageFields.push(key, JSON.stringify(streamPayload[key]));
-                }
-                const streamMaxLen = parseInt(process.env.SIMULATOR_STREAM_MAXLEN, 10) || 1000;
-                const xaddArgs = [responseStreamKey, 'MAXLEN', '~', streamMaxLen.toString(), '*', ...messageFields];
-
-                // Use redisClient from the main app context
-                require('./redisClient').getClient().call('XADD', ...xaddArgs)
-                    .then(messageId => logger.info({ responseStreamKey, messageId, demoApiId: apiId }, 'DEMO_SERVER: Successfully added simulated ASYNC API response to Redis Stream.'))
-                    .catch(err => logger.error({ err, responseStreamKey, demoApiId: apiId }, 'DEMO_SERVER: Error adding ASYNC message to Redis Stream.'));
-
-                // For async, the HTTP response from the demo server itself is just an ack
-                res.status(202).json({ message: "Accepted for async processing by demo server", apiId, correlationId });
-            } else {
-                // For SYNC APIs, respond directly
-                res.status(200).json(responseData);
-            }
+            // All demo server endpoints now simply return an HTTP response.
+            // If it's an async API, apiCallerService.makeRequestAsync will handle getting this response
+            // and then writing it to the Redis Stream.
+            // Demo server can still indicate if it's an async type of response for clarity if desired,
+            // but its primary job is just to respond HTTP.
+            // A 200 OK with data is fine for both sync and async from demo server's perspective,
+            // as apiCallerService.makeRequestAsync knows it's an async call.
+            res.status(200).json(responseData);
         });
     }
 
